@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.log
+.fs25server*/
+game/
+config/
+installer/
+dlc/
+logs/
