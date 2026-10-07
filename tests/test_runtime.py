@@ -7,6 +7,7 @@ import io
 import json
 import os
 import pathlib
+import shlex
 import signal
 import subprocess
 import sys
@@ -690,6 +691,31 @@ class ReviewRegressionTests(RuntimeFixture):
             with self.assertRaisesRegex(OSError, "disk full"):
                 ctl.ensure_steam_appid(directory)
         self.assertEqual(set(directory.rglob("*")), before)
+
+
+class DockerSmokeOwnershipTests(unittest.TestCase):
+    """Build contracts; the actual Wine smoke test runs during the image build."""
+
+    def docker_instructions(self):
+        source = (SOURCE / "Dockerfile").read_text(encoding="utf-8")
+        return source.replace("\\\n", " ").splitlines()
+
+    def test_smoke_prefix_is_created_by_container_before_wineboot(self):
+        instructions = self.docker_instructions()
+        smoke = next(line for line in instructions if line.startswith("RUN ") and "wineboot --init" in line)
+        tokens = shlex.split(smoke)
+        self.assertEqual(tokens[:6], ["RUN", "mkdir", "-m", "0700", "/tmp/fs25-wine-smoke", "&&"])
+        self.assertIn("WINEPREFIX=/tmp/fs25-wine-smoke", tokens[6:])
+        position = instructions.index(smoke)
+        user = next(line for line in reversed(instructions[:position]) if line.startswith("USER "))
+        self.assertEqual(user.split(), ["USER", "container"])
+
+    def test_smoke_dlls_are_owned_by_container_for_tmp_cleanup(self):
+        instructions = self.docker_instructions()
+        copied = next(line for line in instructions if line.startswith("COPY ") and "/steam-api-test.dll" in line)
+        self.assertIn("--chown=container", copied.split())
+        self.assertIn("/steam-api-unsupported-test.dll", copied.split())
+        self.assertEqual(copied.split()[-1], "/tmp/")
 
 
 class EggTests(unittest.TestCase):

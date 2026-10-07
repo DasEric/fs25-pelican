@@ -65,7 +65,7 @@ ADD         --checksum=sha256:7d3654531c32d941b8cae81c4137fc542172bfa9635f169cb3
             /opt/fs25/SteamSetup.exe
 COPY        --from=steam-session /steam-session.exe /opt/fs25/steam-session.exe
 COPY        --from=steam-session /usr/share/doc /opt/fs25/steam-probe-licenses
-COPY        --from=steam-session /steam-api-test.dll /steam-api-unsupported-test.dll /tmp/
+COPY        --from=steam-session --chown=container /steam-api-test.dll /steam-api-unsupported-test.dll /tmp/
 RUN         chmod 0444 /opt/fs25/SteamSetup.exe /opt/fs25/steam-session.exe
 
 # Let Debian select its FFmpeg library ABI instead of pinning release-specific package names.
@@ -176,7 +176,9 @@ USER        container
 WORKDIR     /home/container
 
 # Verify both Windows architectures against the final runtime, without touching server data.
-RUN         WINEPREFIX=/tmp/fs25-wine-smoke WINEDEBUG=-all \
+# Wine needs an existing prefix owned by this user, not the root-owned /tmp parent.
+RUN         mkdir -m 0700 /tmp/fs25-wine-smoke \
+            && WINEPREFIX=/tmp/fs25-wine-smoke WINEDEBUG=-all \
             WINEFSYNC=0 PROTON_NO_NTSYNC=1 WINESERVER=/opt/fs25/wine/bin/wineserver \
             PATH=/opt/fs25/wine/bin:$PATH \
             timeout 240 xvfb-run -a /bin/sh -c \
