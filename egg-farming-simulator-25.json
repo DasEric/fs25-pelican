@@ -4,21 +4,22 @@
     "version": "PTDL_v2",
     "update_url": "https://raw.githubusercontent.com/DasEric/fs25-pelican/main/egg-farming-simulator-25.json"
   },
-  "exported_at": "2026-10-01T00:00:00+02:00",
+  "exported_at": "2026-10-07T00:00:00+02:00",
   "name": "Farming Simulator 25",
   "author": "DasEric@users.noreply.github.com",
-  "description": "Farming Simulator 25 dedicated server with prebuilt Wine-Proton 11, noVNC installation, persistent game data and sequential DLC installation.",
+  "description": "Farming Simulator 25 dedicated server with GIANTS installer or the normal Windows Steam client. Steam login and Steam Guard are completed in noVNC; the session, game, DLCs and server data persist.",
   "features": null,
   "tags": [
     "farming-simulator",
     "wine",
-    "novnc"
+    "novnc",
+    "steam"
   ],
   "docker_images": {
     "FS25 Pelican": "ghcr.io/daseric/fs25-pelican:latest"
   },
   "file_denylist": [],
-  "startup": "wine \"/home/container/game/Farming Simulator 2025/dedicatedServer.exe\"",
+  "startup": "/opt/fs25/fs25ctl.py start-webserver",
   "config": {
     "files": "{}",
     "startup": "{\"done\": \"FS25 image ready.\"}",
@@ -33,6 +34,16 @@
     }
   },
   "variables": [
+    {
+      "name": "Installation source",
+      "description": "giants uses an uploaded GIANTS installer; steam opens the normal Windows Steam client. Sign in and complete Steam Guard through noVNC, install FS25/DLCs, run the game once and close it, then restart the container. Keep Steam running and Remember me enabled.",
+      "env_variable": "INSTALL_SOURCE",
+      "default_value": "giants",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:giants,steam",
+      "field_type": "text"
+    },
     {
       "name": "VNC password",
       "description": "Password for noVNC/VNC; at least six characters.",
@@ -245,7 +256,7 @@
     },
     {
       "name": "Auto-launch installer",
-      "description": "Start an uploaded installer automatically on boot.",
+      "description": "GIANTS only: start an uploaded installer automatically on boot. Steam installation is managed in the noVNC Steam client.",
       "env_variable": "AUTO_INSTALL",
       "default_value": "false",
       "user_viewable": true,
@@ -265,7 +276,7 @@
     },
     {
       "name": "Installer mode",
-      "description": "silent uses the unattended installer flags; interactive shows the installer in noVNC.",
+      "description": "GIANTS only: silent uses unattended installer flags; interactive shows the installer in noVNC.",
       "env_variable": "INSTALL_MODE",
       "default_value": "silent",
       "user_viewable": true,
@@ -305,7 +316,7 @@
     },
     {
       "name": "Run activation after install",
-      "description": "Launch FS25 once for license activation after setup.",
+      "description": "GIANTS only: launch FS25 once for license activation after setup. Steam first-run setup is completed in the Steam client.",
       "env_variable": "ACTIVATE_AFTER_INSTALL",
       "default_value": "true",
       "user_viewable": true,
@@ -315,7 +326,7 @@
     },
     {
       "name": "Automatically install DLCs",
-      "description": "After game installation/activation, launch every missing DLC installer in sequence. Product keys are entered manually in noVNC.",
+      "description": "GIANTS only: launch missing uploaded DLC installers in sequence. In Steam mode, manage installed DLCs in Steam Library > FS25 > Properties > DLC.",
       "env_variable": "AUTO_INSTALL_DLC",
       "default_value": "false",
       "user_viewable": true,

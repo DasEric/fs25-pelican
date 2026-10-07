@@ -1,5 +1,19 @@
 # syntax=docker/dockerfile:1
 
+FROM        ubuntu:24.04 AS steam-session
+RUN         apt-get update \
+            && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 \
+            && rm -rf /var/lib/apt/lists/*
+COPY        steam_session.c /src/steam_session.c
+COPY        tests/steam_api_stub.c /src/steam_api_stub.c
+RUN         x86_64-w64-mingw32-gcc -std=c11 -Os -s -municode \
+                -Wall -Wextra -Werror -Wno-cast-function-type \
+                /src/steam_session.c -o /steam-session.exe \
+            && x86_64-w64-mingw32-gcc -std=c11 -Os -s -shared -Wall -Wextra -Werror \
+                /src/steam_api_stub.c -o /steam-api-test.dll \
+            && x86_64-w64-mingw32-gcc -std=c11 -Os -s -shared -Wall -Wextra -Werror \
+                -DFS25_STUB_UNSUPPORTED /src/steam_api_stub.c -o /steam-api-unsupported-test.dll
+
 # The prebuilt Wine runtime needs FFmpeg 4's ABI. Keep it private to Wine.
 FROM        ubuntu:22.04 AS wine-compat
 RUN         apt-get update \
@@ -34,7 +48,7 @@ LABEL       org.opencontainers.image.authors="Eric <DasEric@users.noreply.github
 
 USER        root
 
-# Independent Wine-Proton runtime: no Steam launcher and no source compilation.
+# Independent Wine-Proton runtime: no Wine source compilation.
 ADD         --checksum=sha256:f166f7daa1a37b3c8e0ade213a6e7915e582091804071a58a4a32c6c672e1595 \
             https://github.com/Kron4ek/Wine-Builds/releases/download/proton-11.0-2/wine-proton-11.0-2-amd64-wow64.tar.xz \
             /tmp/fs25-prebuilt-wine.tar.xz
@@ -44,6 +58,15 @@ ADD         --checksum=sha256:a07652adb965e657837e8013ecb525303fc733555c78a5295a
 ADD         --checksum=sha256:c450f920ef7380f12dca742d8c96bcc672aec36b24b2f10d4d68b9495cd1e20f \
             https://codeload.github.com/Kron4ek/Wine-Builds/tar.gz/fe137c65b411ff3079d1b26573dcb70bf16814a5 \
             /opt/fs25/wine-source/prebuilt-build-recipe.tar.gz
+
+# Official Windows client bootstrap. Steam credentials and games are never baked in.
+ADD         --checksum=sha256:7d3654531c32d941b8cae81c4137fc542172bfa9635f169cb392f245a0a12bcb \
+            https://cdn.fastly.steamstatic.com/client/installer/SteamSetup.exe \
+            /opt/fs25/SteamSetup.exe
+COPY        --from=steam-session /steam-session.exe /opt/fs25/steam-session.exe
+COPY        --from=steam-session /usr/share/doc /opt/fs25/steam-probe-licenses
+COPY        --from=steam-session /steam-api-test.dll /steam-api-unsupported-test.dll /tmp/
+RUN         chmod 0444 /opt/fs25/SteamSetup.exe /opt/fs25/steam-session.exe
 
 # Let Debian select its FFmpeg library ABI instead of pinning release-specific package names.
 RUN         apt update \
@@ -66,6 +89,9 @@ RUN         apt update \
                 libgcrypt20 \
                 libgssapi-krb5-2 \
                 libnuma1 \
+                libgl1 \
+                libegl1 \
+                libgl1-mesa-dri \
                 libsoxr0 \
                 patchelf \
                 xz-utils \
@@ -154,8 +180,14 @@ RUN         WINEPREFIX=/tmp/fs25-wine-smoke WINEDEBUG=-all \
             WINEFSYNC=0 PROTON_NO_NTSYNC=1 WINESERVER=/opt/fs25/wine/bin/wineserver \
             PATH=/opt/fs25/wine/bin:$PATH \
             timeout 240 xvfb-run -a /bin/sh -c \
-                'wineboot --init && wine cmd /d /s /c ver && wine "C:\windows\syswow64\cmd.exe" /d /s /c ver && wineserver -w' \
-            && rm -rf /tmp/fs25-wine-smoke
+                'wineboot --init && wine cmd /d /s /c ver \
+                && wine "C:\windows\syswow64\cmd.exe" /d /s /c ver \
+                && FS25_STEAM_STUB_MODE=ready wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-test.dll" \
+                && { status=0; FS25_STEAM_STUB_MODE=offline wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-test.dll" || status=$?; test "$status" -eq 1; } \
+                && { status=0; wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-unsupported-test.dll" || status=$?; test "$status" -eq 2; } \
+                && wineserver -w' \
+            && rm -rf /tmp/fs25-wine-smoke \
+            && rm /tmp/steam-api-test.dll /tmp/steam-api-unsupported-test.dll
 
 STOPSIGNAL  SIGINT
 

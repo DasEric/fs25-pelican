@@ -2,4 +2,8 @@
 !Dockerfile
 !entrypoint.py
 !fs25ctl.py
+!steam_session.c
+!tests/
+tests/*
+!tests/steam_api_stub.c
 !LICENSE

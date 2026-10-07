@@ -14,14 +14,14 @@ import sys
 import time
 
 
-HOME = pathlib.Path("/home/container")
+HOME = pathlib.Path(os.environ.get("FS25_HOME", "/home/container"))
 LOG_DIR = HOME / "logs"
 INSTALLER_DIR = HOME / "installer"
-GAME_DIR = HOME / "game" / "Farming Simulator 2025"
-SERVER_EXE = GAME_DIR / "dedicatedServer.exe"
 CONTROL = "/opt/fs25/fs25ctl.py"
 children: list[subprocess.Popen] = []
+server_children: list[subprocess.Popen] = []
 stopping = False
+steam_started = False
 
 
 def log(message: str) -> None:
@@ -103,7 +103,32 @@ def spawn(
         if target is not None:
             target.close()
     children.append(process)
+    if log_name in {"dedicated-server.log", "autostart-game.log"}:
+        server_children.append(process)
     return process
+
+
+def stop_processes(processes: list[subprocess.Popen], signum: int) -> None:
+    for process in reversed(processes):
+        # Wine/XFCE launchers can exit while their process group still lives.
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 15
+    for process in reversed(processes):
+        if process.poll() is None:
+            try:
+                process.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    log(f"Process {process.pid} is still exiting after SIGKILL.")
 
 
 def stop_children(signum: int = signal.SIGTERM) -> None:
@@ -111,22 +136,13 @@ def stop_children(signum: int = signal.SIGTERM) -> None:
     if stopping:
         return
     stopping = True
-    for process in reversed(children):
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signum)
-            except ProcessLookupError:
-                pass
-    deadline = time.time() + 15
-    for process in reversed(children):
-        if process.poll() is None:
-            try:
-                process.wait(timeout=max(0.1, deadline - time.time()))
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+    # Keep Steam and the desktop available while the supervised FS25 processes stop.
+    stop_processes(server_children, signum)
+    if steam_started:
+        from fs25ctl import shutdown_steam
+
+        shutdown_steam()
+    stop_processes([process for process in children if process not in server_children], signum)
 
 
 def signal_handler(signum: int, _frame) -> None:
@@ -208,16 +224,57 @@ def start_desktop() -> None:
 
 
 def startup_command() -> list[str]:
-    startup = os.environ.get("STARTUP", 'wine "/home/container/game/Farming Simulator 2025/dedicatedServer.exe"')
+    startup = os.environ.get("STARTUP", f"{CONTROL} start-webserver")
     startup = re.sub(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}", lambda match: os.environ.get(match.group(1), ""), startup)
     startup = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda match: os.environ.get(match.group(1), ""), startup)
     command = shlex.split(startup)
     if not command:
         raise RuntimeError("STARTUP is empty")
+    from fs25ctl import GAME_DIR
+
+    managed = command == [CONTROL, "start-webserver"]
+    legacy = command == ["wine", str(GAME_DIR / "dedicatedServer.exe")]
+    if managed or legacy:
+        # Panel and desktop must use the same locking/readiness checks. Bypassing
+        # the controller here used to allow concurrent starts during Steam login.
+        command = [CONTROL, "start-webserver"]
     return command
 
 
+def wait_for_steam_session(xvnc: subprocess.Popen, timeout: int = 180) -> bool:
+    from fs25ctl import SteamNotReady, ensure_steam_appid, game_directory, steam_session_ready
+
+    log("Waiting for Steam. Complete login / Steam Guard in noVNC if Steam asks for it.")
+    deadline = time.monotonic() + timeout
+    previous = ""
+    while xvnc.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            directory = game_directory()
+            ensure_steam_appid(directory)
+            if steam_session_ready(directory, timeout=remaining) and time.monotonic() < deadline:
+                log("Steam session ready (confirmed by FS25's Steam API).")
+                return True
+            message = "Steam login is pending. Open Steam in noVNC; the client must stay running."
+        except SteamNotReady as exc:
+            message = str(exc)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            log(f"Steam startup check: {exc}")
+            return False
+        if message != previous:
+            log(message)
+            previous = message
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(5, remaining))
+    log("Steam startup is still pending. Finish setup in noVNC, then use Start FS25 web server or restart the container.")
+    return False
+
+
 def main() -> int:
+    global steam_started
     os.environ.update(
         {
             "HOME": str(HOME),
@@ -233,8 +290,15 @@ def main() -> int:
     )
     # Apply these in the parent before Wine starts so the GIANTS game child
     # inherits them, including when an existing prefix skips registry setup.
-    from fs25ctl import configure_runtime, configure_terminal
+    from fs25ctl import (
+        SteamNotReady, configure_runtime, configure_terminal, game_directory, game_server_running,
+        installation_source, steam_command, webserver_running,
+    )
 
+    source = installation_source()
+    mode = os.environ.get("AUTOSTART_SERVER", "web_only").lower()
+    if mode not in {"false", "true", "web_only"}:
+        raise RuntimeError(f"Invalid AUTOSTART_SERVER value: {mode}")
     configure_runtime()
     configure_terminal()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -252,26 +316,52 @@ def main() -> int:
     log("FS25 image ready.")
     log("This is container readiness, not confirmation that the game map has finished loading.")
 
-    if not SERVER_EXE.is_file():
-        handle_incomplete_installation()
-        return xvnc.wait()
+    if source == "steam":
+        log("Steam mode: sign in and complete Steam Guard in the Steam client through noVNC.")
+        log("Keep Remember me enabled. Steam's client/session and game library are persistent.")
+        steam_started = True
+        spawn(steam_command(silent=True), "steam-launch.log")
+        try:
+            directory = game_directory()
+        except SteamNotReady as exc:
+            log(str(exc))
+            log("Use the Steam desktop shortcut if the client needs to be opened again.")
+            return xvnc.wait()
+    else:
+        directory = game_directory()
+        if not (directory / "dedicatedServer.exe").is_file():
+            handle_incomplete_installation()
+            return xvnc.wait()
 
-    if find_installation_media():
+    if source == "giants" and find_installation_media():
         log("Installation is complete. Files in /home/container/installer can be deleted to free disk space.")
 
-    if os.environ.get("AUTO_INSTALL_DLC", "false").lower() == "true":
+    if source == "giants" and os.environ.get("AUTO_INSTALL_DLC", "false").lower() == "true":
         subprocess.run([CONTROL, "install-dlcs"], check=True)
 
-    mode = os.environ.get("AUTOSTART_SERVER", "web_only").lower()
     if mode == "false":
         log("Installation detected. The web server can be started from the desktop.")
         return xvnc.wait()
-    if mode not in {"true", "web_only"}:
-        raise RuntimeError(f"Invalid AUTOSTART_SERVER value: {mode}")
-
-    subprocess.run([CONTROL, "configure"], check=True)
-    subprocess.run([CONTROL, "patch-web"], check=True)
-    command = startup_command()
+    if source == "steam" and not wait_for_steam_session(xvnc):
+        return xvnc.wait()
+    # A user may have started the web server from the desktop during Steam setup.
+    if webserver_running():
+        log("The FS25 web server is already running; use the existing GIANTS Web Interface.")
+        return xvnc.wait()
+    if source == "steam" and game_server_running():
+        log("An FS25 game process is already running. Close the normal game in noVNC, then restart the container.")
+        return xvnc.wait()
+    try:
+        directory = game_directory()
+        command = startup_command()
+        if command != [CONTROL, "start-webserver"]:
+            subprocess.run([CONTROL, "configure"], check=True)
+            subprocess.run([CONTROL, "patch-web"], check=True)
+    except (SteamNotReady, subprocess.CalledProcessError) as exc:
+        if source != "steam":
+            raise
+        log(f"Steam startup is pending: {exc}. Finish setup in noVNC and retry.")
+        return xvnc.wait()
     log("Startup command: " + " ".join(command))
     # Match the desktop launch for GIANTS without changing the working
     # directory of unrelated custom startup commands.
@@ -279,10 +369,17 @@ def main() -> int:
         arg.replace("\\", "/").rsplit("/", 1)[-1].lower() == "dedicatedserver.exe"
         for arg in command
     )
-    server = spawn(command, "dedicated-server.log", cwd=GAME_DIR if game_command else None)
+    server = spawn(command, "dedicated-server.log", cwd=directory if game_command else None)
     if mode == "true":
         spawn([CONTROL, "autostart-game"], "autostart-game.log")
-    return server.wait()
+    status = server.wait()
+    if source == "steam" and status != 0:
+        # A download, expired login or a competing desktop start can happen
+        # after the first check. Keep noVNC instead of tearing down the container.
+        log(f"FS25 startup exited with status {status}. Check noVNC and logs/dedicated-server.log, then retry.")
+        stop_processes([process for process in server_children if process is not server], signal.SIGTERM)
+        return xvnc.wait()
+    return status
 
 
 if __name__ == "__main__":
