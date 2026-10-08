@@ -2,10 +2,11 @@
 
 FROM        ubuntu:24.04 AS steam-session
 RUN         apt-get update \
-            && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 \
+            && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
             && rm -rf /var/lib/apt/lists/*
 COPY        steam_session.c /src/steam_session.c
 COPY        tests/steam_api_stub.c /src/steam_api_stub.c
+COPY        tests/steam_import_fixture.c /src/steam_import_fixture.c
 RUN         x86_64-w64-mingw32-gcc -std=c11 -Os -s -municode \
                 -Wall -Wextra -Werror -Wno-cast-function-type \
                 /src/steam_session.c -o /steam-session.exe \
@@ -13,6 +14,25 @@ RUN         x86_64-w64-mingw32-gcc -std=c11 -Os -s -municode \
                 /src/steam_api_stub.c -o /steam-api-test.dll \
             && x86_64-w64-mingw32-gcc -std=c11 -Os -s -shared -Wall -Wextra -Werror \
                 -DFS25_STUB_UNSUPPORTED /src/steam_api_stub.c -o /steam-api-unsupported-test.dll
+
+# Verify real dependency resolution with Steam DLL names, not only cmd.exe.
+RUN         mkdir /steam-import-64 /steam-import-32 \
+            && x86_64-w64-mingw32-gcc -std=c11 -Os -s -shared -Wall -Wextra -Werror \
+                -DFS25_IMPORT_DEPENDENCY /src/steam_import_fixture.c \
+                -Wl,--out-implib,/steam-import-64/libtier0_s64.a -o /steam-import-64/tier0_s64.dll \
+            && x86_64-w64-mingw32-gcc -std=c11 -Os -s -shared -Wall -Wextra -Werror \
+                -DFS25_IMPORT_CLIENT /src/steam_import_fixture.c -L/steam-import-64 -ltier0_s64 \
+                -o /steam-import-64/steamclient64.dll \
+            && x86_64-w64-mingw32-gcc -std=c11 -Os -s -municode -Wall -Wextra -Werror -Wno-cast-function-type \
+                /src/steam_import_fixture.c -o /steam-import-64/steam-import-test.exe \
+            && i686-w64-mingw32-gcc -std=c11 -Os -s -shared -Wall -Wextra -Werror \
+                -DFS25_IMPORT_DEPENDENCY /src/steam_import_fixture.c \
+                -Wl,--out-implib,/steam-import-32/libtier0.a -o /steam-import-32/tier0.dll \
+            && i686-w64-mingw32-gcc -std=c11 -Os -s -shared -Wall -Wextra -Werror \
+                -DFS25_IMPORT_CLIENT /src/steam_import_fixture.c -L/steam-import-32 -ltier0 \
+                -o /steam-import-32/steamclient.dll \
+            && i686-w64-mingw32-gcc -std=c11 -Os -s -municode -Wall -Wextra -Werror -Wno-cast-function-type \
+                /src/steam_import_fixture.c -o /steam-import-32/steam-import-test.exe
 
 # The prebuilt Wine runtime needs FFmpeg 4's ABI. Keep it private to Wine.
 FROM        ubuntu:22.04 AS wine-compat
@@ -66,6 +86,8 @@ ADD         --checksum=sha256:7d3654531c32d941b8cae81c4137fc542172bfa9635f169cb3
 COPY        --from=steam-session /steam-session.exe /opt/fs25/steam-session.exe
 COPY        --from=steam-session /usr/share/doc /opt/fs25/steam-probe-licenses
 COPY        --from=steam-session --chown=container /steam-api-test.dll /steam-api-unsupported-test.dll /tmp/
+COPY        --from=steam-session --chown=container /steam-import-64 /tmp/steam-import-64/
+COPY        --from=steam-session --chown=container /steam-import-32 /tmp/steam-import-32/
 RUN         chmod 0444 /opt/fs25/SteamSetup.exe /opt/fs25/steam-session.exe
 
 # Let Debian select its FFmpeg library ABI instead of pinning release-specific package names.
@@ -169,6 +191,7 @@ ENV         HOME=/home/container \
             WINEPREFIX=/home/container/.fs25server \
             WINEARCH=win64 \
             WINEDEBUG=-all \
+            PROTON_DISABLE_LSTEAMCLIENT=1 \
             DISPLAY=:0 \
             XDG_RUNTIME_DIR=/tmp/xdg-runtime-fs25
 
@@ -184,11 +207,14 @@ RUN         mkdir -m 0700 /tmp/fs25-wine-smoke \
             timeout 240 xvfb-run -a /bin/sh -c \
                 'wineboot --init && wine cmd /d /s /c ver \
                 && wine "C:\windows\syswow64\cmd.exe" /d /s /c ver \
+                && wine /tmp/steam-import-64/steam-import-test.exe "Z:\tmp\steam-import-64\steamclient64.dll" \
+                && wine /tmp/steam-import-32/steam-import-test.exe "Z:\tmp\steam-import-32\steamclient.dll" \
                 && FS25_STEAM_STUB_MODE=ready wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-test.dll" \
                 && { status=0; FS25_STEAM_STUB_MODE=offline wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-test.dll" || status=$?; test "$status" -eq 1; } \
                 && { status=0; wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-unsupported-test.dll" || status=$?; test "$status" -eq 2; } \
                 && wineserver -w' \
             && rm -rf /tmp/fs25-wine-smoke \
+            && rm -rf /tmp/steam-import-64 /tmp/steam-import-32 \
             && rm /tmp/steam-api-test.dll /tmp/steam-api-unsupported-test.dll
 
 STOPSIGNAL  SIGINT

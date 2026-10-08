@@ -108,6 +108,37 @@ the binary SHA-256 and build recipe commit
 `fe137c65b411ff3079d1b26573dcb70bf16814a5`. WineHQ 11 remains the `stable`
 compatibility option. Wine itself is not compiled by this project.
 
+This image runs the real Windows Steam client, not Linux Steam's Proton
+integration. `PROTON_DISABLE_LSTEAMCLIENT=1` is set in the image and enforced
+before runtime selection, including the already-selected desktop-child path.
+In the pinned Wine source, leaving this unset enables Steam DLL interception
+and redirects `tier0_s64.dll` / `vstdlib_s64.dll` imports from `steamclient64.dll`
+to `ntdll.dll`. Those redirects are inappropriate for our Windows client.
+See [the pinned loader source](https://github.com/ValveSoftware/wine/blob/dc26e61847081a1b5cb0733dc30feba6ee575482/dlls/ntdll/loader.c#L1151-L1211).
+
+The build smoke test loads synthetic Steam-named DLLs and their dependency
+in both Windows architectures. The 64-bit fixture specifically exercises the
+redirected `tier0_s64.dll` import; the 32-bit fixture verifies WoW64 dependency
+loading. These are loader tests, not a real Steam login or UI compatibility
+test. They run as `container` in the isolated smoke prefix and are removed
+afterwards. The C source also runs natively on Windows for regression tests.
+
+For an existing client reporting an installation error or
+`ClientAPI_InitGlobalInstance`, first deploy the rebuilt image and fully stop
+and restart the container. Reopen Steam in noVNC with autostart disabled.
+Keep the existing prefix, client, library and saved login. The log's generic
+32-bit-dependency message alone does not identify a missing Linux package.
+If the error persists, close Steam, then run the existing controller manually
+in the noVNC terminal with import diagnostics and retain the resulting log:
+
+```sh
+WINEDEBUG=+timestamp,+pid,+loaddll,+module /opt/fs25/fs25ctl.py open-steam > /home/container/logs/steam-imports.log 2>&1
+```
+
+This manual command leaves the existing client/data intact. Inspect the first
+missing module, failed export or failed load in that log before changing
+packages. Font warnings alone do not establish the cause of client failure.
+
 FFmpeg 4 ABI compatibility libraries come from Ubuntu 22.04 and remain private
 to Wine in `/opt/fs25/wine-compat`. Package versions and licenses are included.
 ELF search paths are changed only for Wine and those libraries; there is no
@@ -174,6 +205,10 @@ Linux CI additionally tests real lock contention/release; Windows tests use a
 mock for `flock`, and the real Linux lock test is skipped there.
 Optional native tests use `FS25_TEST_NATIVE_PROBE`, `FS25_TEST_NATIVE_STUB` and
 `FS25_TEST_NATIVE_UNSUPPORTED` paths to compiled probe/test DLLs on Windows.
+`FS25_TEST_NATIVE_IMPORTS` optionally points to a directory containing
+`steam-import-32` and `steam-import-64`, each with the compiled import probe,
+Steam-named fixture and dependency DLL. These native tests also cover missing
+dependencies, Unicode paths and missing arguments.
 The Docker build compiles the probe and test DLLs and exercises readiness,
 offline and unsupported-API results under Wine, alongside both Windows command
 interpreters. Test DLLs and the smoke prefix are removed from the final image.

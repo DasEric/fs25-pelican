@@ -61,6 +61,10 @@ container after signing in.
 Existing GIANTS installations are kept when selecting Steam; Steam downloads
 its own copy. Both methods share your server settings, mods and savegames.
 
+If Steam reports an installation error, update to the rebuilt image, fully
+stop/start the container and reopen Steam. Keep your existing Steam files and
+Wine prefix; do not delete them to retry the login.
+
 ## Start and configure the server
 
 | `AUTOSTART_SERVER` | Behaviour |

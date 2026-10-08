@@ -6,4 +6,5 @@
 !tests/
 tests/*
 !tests/steam_api_stub.c
+!tests/steam_import_fixture.c
 !LICENSE

@@ -693,6 +693,54 @@ class ReviewRegressionTests(RuntimeFixture):
         self.assertEqual(set(directory.rglob("*")), before)
 
 
+class WindowsSteamRuntimeTests(RuntimeFixture):
+    def test_cached_selection_still_disables_linux_steam_bridge(self):
+        os.environ["_FS25_RUNTIME_READY"] = "1"
+        ctl.select_wine_runtime()
+        self.assertEqual(os.environ.get("PROTON_DISABLE_LSTEAMCLIENT"), "1")
+
+    def test_inherited_zero_cannot_reenable_linux_steam_bridge(self):
+        os.environ.update({"_FS25_RUNTIME_READY": "1", "PROTON_DISABLE_LSTEAMCLIENT": "0"})
+        ctl.configure_runtime()
+        self.assertEqual(os.environ["PROTON_DISABLE_LSTEAMCLIENT"], "1")
+
+    def test_first_runtime_selection_disables_linux_steam_bridge(self):
+        runtime = self.home / "wine"
+        (runtime / "bin").mkdir(parents=True)
+        for name in ("wine", "wineserver"):
+            (runtime / "bin" / name).touch()
+        with mock.patch.object(ctl, "PROTON_DIR", runtime), mock.patch.object(ctl, "probe_fsync", return_value=(False, "test")):
+            ctl.select_wine_runtime()
+        self.assertEqual(os.environ.get("PROTON_DISABLE_LSTEAMCLIENT"), "1")
+        self.assertEqual(os.environ["WINESERVER"], str(runtime / "bin/wineserver"))
+
+    def test_bridge_is_disabled_before_prefix_boot_and_preserves_data(self):
+        os.environ.update({"INSTALL_SOURCE": "steam", "_FS25_RUNTIME_READY": "1"})
+        self.steam.mkdir(parents=True)
+        saved = self.steam / "loginusers.vdf"
+        saved.write_bytes(b"saved session fixture")
+
+        def check_environment():
+            self.assertEqual(os.environ.get("PROTON_DISABLE_LSTEAMCLIENT"), "1")
+
+        with mock.patch.object(ctl, "ensure_prefix", side_effect=check_environment), \
+                mock.patch.object(ctl, "configure_headless_wine"), \
+                mock.patch.object(ctl, "link_persistent"), \
+                mock.patch.object(ctl, "create_desktop_shortcuts"):
+            ctl.prepare()
+        self.assertEqual(saved.read_bytes(), b"saved session fixture")
+
+    def test_game_api_probe_inherits_windows_steam_configuration(self):
+        directory = self.session_fixture()
+        os.environ["_FS25_RUNTIME_READY"] = "1"
+        ctl.configure_runtime()
+        results = [subprocess.CompletedProcess([], 0, "path", ""),
+                   subprocess.CompletedProcess([], 0, "STEAM_SESSION_READY\n", "")]
+        with mock.patch.object(ctl.subprocess, "run", side_effect=results) as run:
+            self.assertTrue(ctl.steam_session_ready(directory))
+        self.assertEqual(run.call_args.kwargs["env"].get("PROTON_DISABLE_LSTEAMCLIENT"), "1")
+
+
 class DockerSmokeOwnershipTests(unittest.TestCase):
     """Build contracts; the actual Wine smoke test runs during the image build."""
 
@@ -716,6 +764,23 @@ class DockerSmokeOwnershipTests(unittest.TestCase):
         self.assertIn("--chown=container", copied.split())
         self.assertIn("/steam-api-unsupported-test.dll", copied.split())
         self.assertEqual(copied.split()[-1], "/tmp/")
+
+    def test_windows_steam_environment_precedes_wineboot(self):
+        instructions = self.docker_instructions()
+        environment = next(line for line in instructions if line.startswith("ENV "))
+        self.assertIn("PROTON_DISABLE_LSTEAMCLIENT=1", shlex.split(environment))
+        smoke = next(line for line in instructions if line.startswith("RUN ") and "wineboot --init" in line)
+        self.assertLess(instructions.index(environment), instructions.index(smoke))
+
+    def test_client_dependency_loading_is_smoked_for_both_architectures(self):
+        instructions = self.docker_instructions()
+        smoke = next(line for line in instructions if line.startswith("RUN ") and "wineboot --init" in line)
+        for architecture, name in (("64", "steamclient64.dll"), ("32", "steamclient.dll")):
+            self.assertIn(f"wine /tmp/steam-import-{architecture}/steam-import-test.exe", smoke)
+            self.assertIn(name, smoke)
+        source = (SOURCE / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("gcc-mingw-w64-i686", source)
+        self.assertIn("!tests/steam_import_fixture.c", (SOURCE / ".dockerignore").read_text(encoding="utf-8"))
 
 
 class EggTests(unittest.TestCase):
@@ -894,6 +959,49 @@ class NativeSteamProbeTests(unittest.TestCase):
             path.write_bytes(pathlib.Path(os.environ["FS25_TEST_NATIVE_STUB"]).read_bytes())
             result = self.probe(dll=str(path))
         self.assertEqual((result.returncode, result.stdout.strip()), (0, "STEAM_SESSION_READY"))
+
+
+@unittest.skipUnless(os.environ.get("FS25_TEST_NATIVE_IMPORTS"), "Optional native 32/64-bit DLL import fixtures; also run in the Docker build")
+class NativeSteamImportTests(unittest.TestCase):
+    def probe(self, architecture, *, directory=None, arguments=None):
+        root = pathlib.Path(os.environ["FS25_TEST_NATIVE_IMPORTS"]) / f"steam-import-{architecture}"
+        client = (directory or root) / ("steamclient64.dll" if architecture == "64" else "steamclient.dll")
+        return subprocess.run([str(root / "steam-import-test.exe"),
+                               *(arguments if arguments is not None else [str(client)])],
+                              capture_output=True, text=True, timeout=15)
+
+    def test_both_clients_load_their_real_dependency(self):
+        for architecture in ("32", "64"):
+            with self.subTest(architecture=architecture):
+                result = self.probe(architecture)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, f"STEAM_IMPORT_READY_{architecture}"))
+
+    def test_missing_dependency_is_detected(self):
+        for architecture in ("32", "64"):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temp:
+                source = pathlib.Path(os.environ["FS25_TEST_NATIVE_IMPORTS"]) / f"steam-import-{architecture}"
+                client = "steamclient64.dll" if architecture == "64" else "steamclient.dll"
+                (pathlib.Path(temp) / client).write_bytes((source / client).read_bytes())
+                result = self.probe(architecture, directory=pathlib.Path(temp))
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("STEAM_IMPORT_LOAD_FAILED", result.stderr)
+
+    def test_unicode_path_preserves_dependency_search(self):
+        for architecture in ("32", "64"):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temp:
+                directory = pathlib.Path(temp) / "Steam ü"
+                directory.mkdir()
+                source = pathlib.Path(os.environ["FS25_TEST_NATIVE_IMPORTS"]) / f"steam-import-{architecture}"
+                for dll in source.glob("*.dll"):
+                    (directory / dll.name).write_bytes(dll.read_bytes())
+                result = self.probe(architecture, directory=directory)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, f"STEAM_IMPORT_READY_{architecture}"))
+
+    def test_missing_path_is_reported(self):
+        for architecture in ("32", "64"):
+            with self.subTest(architecture=architecture):
+                result = self.probe(architecture, arguments=[])
+                self.assertEqual((result.returncode, result.stderr.strip()), (2, "STEAM_IMPORT_PATH_REQUIRED"))
 
 
 if __name__ == "__main__":

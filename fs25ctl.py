@@ -538,6 +538,10 @@ print("futex_waitv and shared memory are available", flush=True)
 
 def select_wine_runtime() -> None:
     """Select once in the parent; desktop and GIANTS children inherit the result."""
+    # This image runs Windows Steam, never Linux Steam. Proton otherwise hooks
+    # steamclient DLLs and redirects their tier0/vstdlib imports to ntdll.
+    # Enforce this even for desktop children inheriting a selected runtime.
+    os.environ["PROTON_DISABLE_LSTEAMCLIENT"] = "1"
     if env("_FS25_RUNTIME_READY") == "1":
         return
     settings = {}
