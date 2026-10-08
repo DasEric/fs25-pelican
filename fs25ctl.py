@@ -257,11 +257,30 @@ def steam_executable() -> pathlib.Path | None:
 def steam_command(*, silent: bool = False) -> list[str]:
     executable = steam_executable()
     if executable:
-        return ["wine", str(executable), *(["-silent"] if silent else [])]
+        # Xvnc normally has no GPU render node. Limit this to Steam's CEF UI;
+        # do not change graphics or synchronization options for the FS25 game.
+        gui = [] if true_value(env("FS25_STEAM_GPU", "false")) else ["-cef-disable-gpu"]
+        return ["wine", str(executable), *gui, *(["-silent"] if silent else [])]
     if not STEAM_SETUP.is_file():
         raise RuntimeError("The bundled Windows Steam installer is missing; pull the updated FS25 image")
     # NSIS requires /D to be the last argument. Login and Guard stay in Steam's UI.
     return ["wine", str(STEAM_SETUP), "/S", r"/D=C:\Steam"]
+
+
+def steam_launch_context(*, silent: bool = False) -> tuple[list[str], pathlib.Path, dict[str, str]]:
+    """Shared desktop/panel launch settings after prepare/configure_runtime."""
+    command = steam_command(silent=silent)
+    client = command[1] != str(STEAM_SETUP)
+    cwd = pathlib.Path(command[1]).parent
+    launch_env = os.environ.copy()
+    launch_env["PROTON_DISABLE_LSTEAMCLIENT"] = "1"
+    if launch_env.get("WINEDEBUG", "-all").strip() in {"", "-all"}:
+        launch_env["WINEDEBUG"] = "-all,err+all"
+    log(f"Starting Steam {'client' if client else 'installer'}: {command[1]}")
+    log(f"Steam working directory: {cwd}; UI: {'background' if silent and client else 'visible'}.")
+    log(f"Steam Wine diagnostics: {launch_env['WINEDEBUG']}; client logs: {STEAM_DIR / 'logs'}.")
+    log("An open terminal or updater is not proof that the Steam login/library window is ready.")
+    return command, cwd, launch_env
 
 
 def open_steam() -> None:
@@ -269,8 +288,9 @@ def open_steam() -> None:
         raise RuntimeError("Select INSTALL_SOURCE=steam in the panel to use the Steam installation")
     prepare()
     log("Use Steam in noVNC to sign in, complete Steam Guard and install/manage FS25 and its DLCs.")
-    command = steam_command()
-    os.execvp(command[0], command)
+    command, cwd, launch_env = steam_launch_context()
+    os.chdir(cwd)
+    os.execvpe(command[0], command, launch_env)
 
 
 def ensure_steam_appid(directory: pathlib.Path) -> None:

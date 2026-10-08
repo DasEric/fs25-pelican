@@ -377,8 +377,8 @@ class SteamClientTests(RuntimeFixture):
         executable = self.steam / "steam.exe"
         executable.touch()
         with mock.patch.dict(os.environ, {"STEAM_PASSWORD": "secret", "STEAM_GUARD_CODE": "ABCDE"}):
-            self.assertEqual(ctl.steam_command(silent=True), ["wine", str(executable), "-silent"])
-            self.assertEqual(ctl.steam_command(), ["wine", str(executable)])
+            self.assertEqual(ctl.steam_command(silent=True), ["wine", str(executable), "-cef-disable-gpu", "-silent"])
+            self.assertEqual(ctl.steam_command(), ["wine", str(executable), "-cef-disable-gpu"])
 
     def test_client_filename_case(self):
         self.steam.mkdir(parents=True)
@@ -457,6 +457,136 @@ class SteamClientTests(RuntimeFixture):
             ctl.shutdown_steam()
         self.assertEqual(run.call_args.args[0][-1], "-shutdown")
         self.assertEqual(run.call_args.kwargs["timeout"], 10)
+
+
+class SteamGuiLaunchTests(RuntimeFixture):
+    def client_fixture(self):
+        self.steam.mkdir(parents=True)
+        client = self.steam / "steam.exe"
+        client.touch()
+        os.environ["INSTALL_SOURCE"] = "steam"
+        return client
+
+    def test_both_client_modes_disable_cef_gpu_by_default(self):
+        self.client_fixture()
+        for silent in (False, True):
+            with self.subTest(silent=silent):
+                command = ctl.steam_command(silent=silent)
+                self.assertIn("-cef-disable-gpu", command)
+                self.assertEqual("-silent" in command, silent)
+
+    def test_gpu_opt_in_changes_only_client_arguments(self):
+        self.client_fixture()
+        os.environ["FS25_STEAM_GPU"] = "true"
+        self.assertNotIn("-cef-disable-gpu", ctl.steam_command())
+        self.assertNotIn("-cef-disable-sandbox", ctl.steam_command())
+
+    def test_context_selects_client_cwd_and_visible_errors_without_mutating_parent(self):
+        client = self.client_fixture()
+        os.environ["WINEDEBUG"] = "-all"
+        command, cwd, environment = ctl.steam_launch_context()
+        self.assertEqual(command[1], str(client))
+        self.assertEqual(cwd, client.parent)
+        self.assertEqual(environment["WINEDEBUG"], "-all,err+all")
+        self.assertEqual(environment["PROTON_DISABLE_LSTEAMCLIENT"], "1")
+        self.assertEqual(os.environ["WINEDEBUG"], "-all")
+
+    def test_context_preserves_explicit_import_diagnostics(self):
+        self.client_fixture()
+        trace = "+timestamp,+pid,+module,+loaddll"
+        os.environ["WINEDEBUG"] = trace
+        self.assertEqual(ctl.steam_launch_context()[2]["WINEDEBUG"], trace)
+
+    def test_installer_context_does_not_receive_cef_flags(self):
+        installer = self.home / "tools/SteamSetup.exe"
+        installer.parent.mkdir()
+        installer.touch()
+        with mock.patch.object(ctl, "STEAM_SETUP", installer):
+            command, cwd, environment = ctl.steam_launch_context(silent=True)
+        self.assertEqual(cwd, installer.parent)
+        self.assertEqual(command, ["wine", str(installer), "/S", r"/D=C:\Steam"])
+        self.assertEqual(environment["WINEDEBUG"], "-all,err+all")
+
+    def test_desktop_launch_passes_same_directory_and_environment(self):
+        self.client_fixture()
+        with mock.patch.object(ctl, "prepare"), mock.patch.object(ctl.os, "chdir") as chdir, \
+                mock.patch.object(ctl.os, "execvpe") as execute:
+            ctl.open_steam()
+        chdir.assert_called_once_with(self.steam)
+        self.assertIn("-cef-disable-gpu", execute.call_args.args[1])
+        self.assertEqual(execute.call_args.args[2]["WINEDEBUG"], "-all,err+all")
+
+    def test_launch_context_uses_the_selected_command_even_if_installation_changes(self):
+        installer = self.home / "tools/SteamSetup.exe"
+        installer.parent.mkdir()
+        installer.touch()
+        with mock.patch.object(ctl, "STEAM_SETUP", installer), \
+                mock.patch.object(ctl, "steam_executable", side_effect=[None, self.steam / "steam.exe"]) as check:
+            command, cwd, environment = ctl.steam_launch_context()
+        self.assertEqual(command[1], str(installer))
+        self.assertEqual(cwd, installer.parent)
+        self.assertEqual(check.call_count, 1)
+
+    def test_automatic_launch_uses_same_headless_client_context(self):
+        self.client_fixture()
+        run, spawn = EntrypointTests.main_fixture(self, "steam", installed=True, mode="false")
+        self.assertEqual(entry.main(), 0)
+        call = next(call for call in spawn.call_args_list if call.args[1] == "steam-launch.log")
+        self.assertEqual(call.kwargs["cwd"], self.steam)
+        self.assertEqual(call.kwargs["process_env"]["WINEDEBUG"], "-all,err+all")
+        self.assertIn("-cef-disable-gpu", call.args[0])
+        self.assertNotIn("-silent", call.args[0])
+
+    def test_initial_setup_is_visible_and_installed_autostart_is_background(self):
+        self.client_fixture()
+        run, spawn = EntrypointTests.main_fixture(self, "steam", installed=False, mode="web_only")
+        self.assertEqual(entry.main(), 0)
+        call = next(call for call in spawn.call_args_list if call.args[1] == "steam-launch.log")
+        self.assertNotIn("-silent", call.args[0])
+        self.steam_install()
+        spawn.reset_mock()
+        self.assertEqual(entry.main(), 0)
+        call = next(call for call in spawn.call_args_list if call.args[1] == "steam-launch.log")
+        self.assertIn("-silent", call.args[0])
+
+    def test_append_log_has_separate_launch_markers_and_runtime_flags(self):
+        self.client_fixture()
+        environment = {"WINEDEBUG": "-all,err+all", "PROTON_DISABLE_LSTEAMCLIENT": "1", "WINEFSYNC": "0", "PROTON_NO_NTSYNC": "1"}
+        path = self.home / "logs/steam-launch.log"
+        path.parent.mkdir(parents=True)
+        path.write_text("previous output\n", encoding="utf-8")
+        with mock.patch.object(entry.subprocess, "Popen", return_value=mock.Mock()) as popen:
+            entry.spawn(["wine", "Steam.exe", "-cef-disable-gpu"], "steam-launch.log", cwd=self.steam, process_env=environment)
+            entry.spawn(["wine", "Steam.exe", "-cef-disable-gpu"], "steam-launch.log", cwd=self.steam, process_env=environment)
+        contents = path.read_text(encoding="utf-8")
+        self.assertTrue(contents.startswith("previous output\n"))
+        self.assertEqual(contents.count("Launch:"), 2)
+        self.assertRegex(contents, r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z Launch:")
+        self.assertIn("WINEFSYNC=0", contents)
+        self.assertEqual(popen.call_args.kwargs["env"], environment)
+
+    def test_documented_diagnostic_command_is_valid(self):
+        docs = (SOURCE / "docs/MAINTAINER.md").read_text(encoding="utf-8")
+        self.assertIn("/opt/fs25/fs25ctl.py steam >", docs)
+        self.assertNotIn("/opt/fs25/fs25ctl.py open-steam >", docs)
+
+    def test_log_write_failure_closes_file_and_does_not_spawn(self):
+        target = mock.Mock()
+        target.write.side_effect = OSError("disk full")
+        with mock.patch.object(pathlib.Path, "open", return_value=target), \
+                mock.patch.object(entry.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(OSError, "disk full"):
+                entry.spawn(["wine", "Steam.exe"], "steam-launch.log")
+        target.close.assert_called_once_with()
+        popen.assert_not_called()
+
+    def test_image_has_true_type_fonts_and_both_gui_smokes(self):
+        docker = (SOURCE / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("fonts-liberation", docker)
+        self.assertIn("fc-cache -f", docker)
+        self.assertIn("wine /tmp/steam-import-64/steam-gui-test.exe", docker)
+        self.assertIn("wine /tmp/steam-import-32/steam-gui-test.exe", docker)
+        self.assertIn("!tests/steam_gui_probe.c", (SOURCE / ".dockerignore").read_text(encoding="utf-8"))
 
 
 class EntrypointTests(RuntimeFixture):
@@ -1002,6 +1132,25 @@ class NativeSteamImportTests(unittest.TestCase):
             with self.subTest(architecture=architecture):
                 result = self.probe(architecture, arguments=[])
                 self.assertEqual((result.returncode, result.stderr.strip()), (2, "STEAM_IMPORT_PATH_REQUIRED"))
+
+
+@unittest.skipUnless(os.environ.get("FS25_TEST_NATIVE_GUI"), "Optional native Win32 font/thread probes; also run in the Docker build")
+class NativeSteamGuiTests(unittest.TestCase):
+    def test_font_measurement_and_worker_thread_in_both_architectures(self):
+        root = pathlib.Path(os.environ["FS25_TEST_NATIVE_GUI"])
+        for architecture in ("32", "64"):
+            with self.subTest(architecture=architecture):
+                result = subprocess.run([str(root / f"steam-import-{architecture}/steam-gui-test.exe")], capture_output=True, text=True, timeout=15)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, f"STEAM_GUI_READY_{architecture}"))
+
+    def test_probe_pe_machine_types(self):
+        root = pathlib.Path(os.environ["FS25_TEST_NATIVE_GUI"])
+        for architecture, expected in (("32", 0x14c), ("64", 0x8664)):
+            with self.subTest(architecture=architecture):
+                data = (root / f"steam-import-{architecture}/steam-gui-test.exe").read_bytes()
+                header = int.from_bytes(data[0x3c:0x40], "little")
+                self.assertEqual(data[header:header + 4], b"PE\0\0")
+                self.assertEqual(int.from_bytes(data[header + 4:header + 6], "little"), expected)
 
 
 if __name__ == "__main__":

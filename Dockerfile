@@ -7,6 +7,7 @@ RUN         apt-get update \
 COPY        steam_session.c /src/steam_session.c
 COPY        tests/steam_api_stub.c /src/steam_api_stub.c
 COPY        tests/steam_import_fixture.c /src/steam_import_fixture.c
+COPY        tests/steam_gui_probe.c /src/steam_gui_probe.c
 RUN         x86_64-w64-mingw32-gcc -std=c11 -Os -s -municode \
                 -Wall -Wextra -Werror -Wno-cast-function-type \
                 /src/steam_session.c -o /steam-session.exe \
@@ -33,6 +34,11 @@ RUN         mkdir /steam-import-64 /steam-import-32 \
                 -o /steam-import-32/steamclient.dll \
             && i686-w64-mingw32-gcc -std=c11 -Os -s -municode -Wall -Wextra -Werror -Wno-cast-function-type \
                 /src/steam_import_fixture.c -o /steam-import-32/steam-import-test.exe
+
+RUN         x86_64-w64-mingw32-gcc -std=c11 -Os -s -Wall -Wextra -Werror \
+                /src/steam_gui_probe.c -lgdi32 -o /steam-import-64/steam-gui-test.exe \
+            && i686-w64-mingw32-gcc -std=c11 -Os -s -Wall -Wextra -Werror \
+                /src/steam_gui_probe.c -lgdi32 -o /steam-import-32/steam-gui-test.exe
 
 # The prebuilt Wine runtime needs FFmpeg 4's ABI. Keep it private to Wine.
 FROM        ubuntu:22.04 AS wine-compat
@@ -118,7 +124,9 @@ RUN         apt update \
                 patchelf \
                 xz-utils \
                 firefox-esr \
+                fontconfig \
                 fonts-dejavu-core \
+                fonts-liberation \
                 libarchive-tools \
                 netcat-openbsd \
                 novnc \
@@ -143,6 +151,7 @@ RUN         apt update \
                 xfdesktop4 \
                 xfwm4 \
             && update-alternatives --set x-terminal-emulator /usr/bin/xterm \
+            && fc-cache -f \
             && apt clean \
             && rm -rf /var/lib/apt/lists/*
 
@@ -209,6 +218,8 @@ RUN         mkdir -m 0700 /tmp/fs25-wine-smoke \
                 && wine "C:\windows\syswow64\cmd.exe" /d /s /c ver \
                 && wine /tmp/steam-import-64/steam-import-test.exe "Z:\tmp\steam-import-64\steamclient64.dll" \
                 && wine /tmp/steam-import-32/steam-import-test.exe "Z:\tmp\steam-import-32\steamclient.dll" \
+                && wine /tmp/steam-import-64/steam-gui-test.exe \
+                && wine /tmp/steam-import-32/steam-gui-test.exe \
                 && FS25_STEAM_STUB_MODE=ready wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-test.dll" \
                 && { status=0; FS25_STEAM_STUB_MODE=offline wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-test.dll" || status=$?; test "$status" -eq 1; } \
                 && { status=0; wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-unsupported-test.dll" || status=$?; test "$status" -eq 2; } \

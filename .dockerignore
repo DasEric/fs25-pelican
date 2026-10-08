@@ -7,4 +7,5 @@
 tests/*
 !tests/steam_api_stub.c
 !tests/steam_import_fixture.c
+!tests/steam_gui_probe.c
 !LICENSE

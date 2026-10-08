@@ -90,14 +90,22 @@ def spawn(
     log_name: str | None = None,
     *,
     cwd: pathlib.Path | None = None,
+    process_env: dict[str, str] | None = None,
 ) -> subprocess.Popen:
     target = None
-    if log_name:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        target = (LOG_DIR / log_name).open("a", encoding="utf-8", errors="replace")
     try:
+        if log_name:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            target = (LOG_DIR / log_name).open("a", encoding="utf-8", errors="replace")
+            if log_name == "steam-launch.log":
+                steam_env = process_env if process_env is not None else os.environ
+                target.write(f"[FS25] {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} Launch: {shlex.join(args)}\n")
+                target.write(f"[FS25] cwd={cwd}; WINEDEBUG={steam_env.get('WINEDEBUG')}; "
+                             f"PROTON_DISABLE_LSTEAMCLIENT={steam_env.get('PROTON_DISABLE_LSTEAMCLIENT')}; "
+                             f"WINEFSYNC={steam_env.get('WINEFSYNC')}; PROTON_NO_NTSYNC={steam_env.get('PROTON_NO_NTSYNC')}\n")
+                target.flush()
         process = subprocess.Popen(
-            args, cwd=cwd, stdout=target, stderr=subprocess.STDOUT, start_new_session=True,
+            args, cwd=cwd, env=process_env, stdout=target, stderr=subprocess.STDOUT, start_new_session=True,
         )
     finally:
         if target is not None:
@@ -292,7 +300,7 @@ def main() -> int:
     # inherits them, including when an existing prefix skips registry setup.
     from fs25ctl import (
         SteamNotReady, configure_runtime, configure_terminal, game_directory, game_server_running,
-        installation_source, steam_command, webserver_running,
+        installation_source, steam_launch_context, webserver_running,
     )
 
     source = installation_source()
@@ -319,12 +327,19 @@ def main() -> int:
     if source == "steam":
         log("Steam mode: sign in and complete Steam Guard in the Steam client through noVNC.")
         log("Keep Remember me enabled. Steam's client/session and game library are persistent.")
-        steam_started = True
-        spawn(steam_command(silent=True), "steam-launch.log")
+        pending = None
         try:
             directory = game_directory()
         except SteamNotReady as exc:
-            log(str(exc))
+            directory = None
+            pending = str(exc)
+        # First setup and desktop-only mode need the login/library window,
+        # not a hidden client. Background mode is only for installed autostarts.
+        steam_started = True
+        steam_args, steam_cwd, steam_env = steam_launch_context(silent=mode != "false" and directory is not None)
+        spawn(steam_args, "steam-launch.log", cwd=steam_cwd, process_env=steam_env)
+        if pending is not None:
+            log(pending)
             log("Use the Steam desktop shortcut if the client needs to be opened again.")
             return xvnc.wait()
     else:

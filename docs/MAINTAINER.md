@@ -132,12 +132,39 @@ If the error persists, close Steam, then run the existing controller manually
 in the noVNC terminal with import diagnostics and retain the resulting log:
 
 ```sh
-WINEDEBUG=+timestamp,+pid,+loaddll,+module /opt/fs25/fs25ctl.py open-steam > /home/container/logs/steam-imports.log 2>&1
+WINEDEBUG=+timestamp,+pid,+loaddll,+module /opt/fs25/fs25ctl.py steam > /home/container/logs/steam-imports.log 2>&1
 ```
 
 This manual command leaves the existing client/data intact. Inspect the first
 missing module, failed export or failed load in that log before changing
 packages. Font warnings alone do not establish the cause of client failure.
+
+Both automatic and desktop Steam starts use the client directory as working
+directory (the installer uses its own directory). They enable Wine errors by
+default while preserving an explicit diagnostic `WINEDEBUG` value. The launch
+log appends a UTC launch marker, arguments, working directory and relevant
+runtime flags; it is not overwritten on restart. This separates successive
+starts, but does not timestamp every line emitted by Steam itself.
+First/partial FS25 setup and `AUTOSTART_SERVER=false` launch the client visibly;
+`-silent` is reserved for installed game autostarts.
+
+Xvnc commonly has no render node. Steam's CEF GUI uses `-cef-disable-gpu` by
+default; `FS25_STEAM_GPU=true` restores its normal GPU path if desired. This
+does not change the FS25 game's graphics/synchronization options. It is a
+headless compatibility setting, not proof of a particular CEF crash.
+See [Valve's GPU-disabled launch recommendation](https://github.com/ValveSoftware/steam-for-linux/issues/11610).
+The image includes Liberation TrueType substitutes and refreshes Fontconfig.
+The build additionally measures text through Win32 GDI and creates/joins a
+Win32 worker thread in each architecture. Successful substitutes/text metrics
+are not a test of Steam's full CEF/DirectWrite UI or an authenticated login.
+
+For a missing Steam window, inspect `bootstrap_log.txt`, `webhelper.txt` and
+`cef_log.txt` inside `C:\Steam\logs` (normally
+`/home/container/steam/library/logs`). Host/launcher logs alone may not identify
+the failing client phase. The Linux shell command `steam` is not installed;
+use `/opt/fs25/fs25ctl.py steam` to open the Windows client. X connection loss
+can follow a container stop; an untimestamped worker-thread error adjacent to
+it does not by itself establish the initial startup cause.
 
 FFmpeg 4 ABI compatibility libraries come from Ubuntu 22.04 and remain private
 to Wine in `/opt/fs25/wine-compat`. Package versions and licenses are included.
@@ -209,6 +236,8 @@ Optional native tests use `FS25_TEST_NATIVE_PROBE`, `FS25_TEST_NATIVE_STUB` and
 `steam-import-32` and `steam-import-64`, each with the compiled import probe,
 Steam-named fixture and dependency DLL. These native tests also cover missing
 dependencies, Unicode paths and missing arguments.
+`FS25_TEST_NATIVE_GUI` can point to the same layout with `steam-gui-test.exe`
+in each architecture directory for native Windows text/thread tests.
 The Docker build compiles the probe and test DLLs and exercises readiness,
 offline and unsupported-API results under Wine, alongside both Windows command
 interpreters. Test DLLs and the smoke prefix are removed from the final image.
