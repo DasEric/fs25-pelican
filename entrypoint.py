@@ -100,7 +100,8 @@ def spawn(
             if log_name == "steam-launch.log":
                 steam_env = process_env if process_env is not None else os.environ
                 target.write(f"[FS25] {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} Launch: {shlex.join(args)}\n")
-                target.write(f"[FS25] cwd={cwd}; WINEDEBUG={steam_env.get('WINEDEBUG')}; "
+                target.write(f"[FS25] backend=native-linux; HOME={steam_env.get('HOME')}; DISPLAY={steam_env.get('DISPLAY')}; "
+                             f"cwd={cwd}; WINEDEBUG={steam_env.get('WINEDEBUG')}; "
                              f"PROTON_DISABLE_LSTEAMCLIENT={steam_env.get('PROTON_DISABLE_LSTEAMCLIENT')}; "
                              f"WINEFSYNC={steam_env.get('WINEFSYNC')}; PROTON_NO_NTSYNC={steam_env.get('PROTON_NO_NTSYNC')}\n")
                 target.flush()
@@ -335,9 +336,13 @@ def main() -> int:
             pending = str(exc)
         # First setup and desktop-only mode need the login/library window,
         # not a hidden client. Background mode is only for installed autostarts.
-        steam_started = True
-        steam_args, steam_cwd, steam_env = steam_launch_context(silent=mode != "false" and directory is not None)
-        spawn(steam_args, "steam-launch.log", cwd=steam_cwd, process_env=steam_env)
+        try:
+            steam_args, steam_cwd, steam_env = steam_launch_context(silent=mode != "false" and directory is not None)
+            spawn(steam_args, "steam-launch.log", cwd=steam_cwd, process_env=steam_env)
+            steam_started = True
+        except (OSError, RuntimeError) as exc:
+            log(f"Native Steam launch failed: {exc}; check logs/steam-launch.log. noVNC stays available.")
+            return xvnc.wait()
         if pending is not None:
             log(pending)
             log("Use the Steam desktop shortcut if the client needs to be opened again.")

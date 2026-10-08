@@ -31,7 +31,7 @@ class RuntimeFixture(unittest.TestCase):
         self.prefix = self.home / ".fs25server"
         self.game = self.home / "game" / "Farming Simulator 2025"
         self.config = self.home / "config" / "FarmingSimulator2025"
-        self.steam = self.prefix / "drive_c" / "Steam"
+        self.steam = self.home / ".local" / "share" / "Steam"
         self.library = self.home / "steam" / "library"
         paths = {
             "HOME": self.home,
@@ -52,12 +52,16 @@ class RuntimeFixture(unittest.TestCase):
         for name, value in {
             "STEAM_DIR": self.steam,
             "STEAM_LIBRARY_DIR": self.library,
+            "STEAM_LAUNCHER": self.home / "bin/steam",
         }.items():
             if hasattr(ctl, name):
                 paths[name] = value
         patcher = mock.patch.multiple(ctl, **paths)
         patcher.start()
         self.addCleanup(patcher.stop)
+        if hasattr(ctl, "STEAM_LAUNCHER"):
+            ctl.STEAM_LAUNCHER.parent.mkdir()
+            ctl.STEAM_LAUNCHER.write_bytes(b"native launcher fixture")
         entry_patcher = mock.patch.multiple(
             entry, HOME=self.home, LOG_DIR=self.home / "logs", INSTALLER_DIR=self.home / "installer",
             children=[], server_children=[], stopping=False, steam_started=False,
@@ -94,13 +98,27 @@ class RuntimeFixture(unittest.TestCase):
         os.environ["INSTALL_SOURCE"] = "steam"
         directory = self.steam_install()
         self.steam.mkdir(parents=True, exist_ok=True)
-        (self.steam / "steam.exe").touch()
+        (self.steam / "linux64").mkdir()
+        (self.steam / "linux64/steamclient.so").touch()
+        self.proton_fixture(directory)
         helper = self.home / "steam-session.exe"
         helper.touch()
         patcher = mock.patch.object(ctl, "STEAM_SESSION_HELPER", helper)
         patcher.start()
         self.addCleanup(patcher.stop)
         return directory
+
+    def proton_fixture(self, directory):
+        tool = self.home / "tools/Proton 11.0"
+        for filename in ("proton", "files/bin/wine", "files/bin/wineserver", "files/lib/wine/x86_64-unix/lsteamclient.so"):
+            path = tool / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"full Proton fixture")
+        data = directory.parent.parent / "compatdata/2300320"
+        (data / "pfx").mkdir(parents=True, exist_ok=True)
+        (data / "pfx/system.reg").write_bytes(b"prefix fixture")
+        (data / "config_info").write_text(f"11.1000\n{tool / 'files/share/fonts'}\n{tool / 'files/lib'}\n{self.steam}\n", encoding="utf-8")
+        return tool, data
 
 
 class ExistingBehaviourTests(RuntimeFixture):
@@ -185,14 +203,17 @@ class InstallationTests(RuntimeFixture):
         with mock.patch.multiple(ctl, configure_runtime=mock.DEFAULT, ensure_prefix=mock.DEFAULT, configure_headless_wine=mock.DEFAULT, prepare_steam_layout=mock.DEFAULT, link_persistent=mock.DEFAULT, create_desktop_shortcuts=mock.DEFAULT, configure=mock.DEFAULT) as functions:
             ctl.prepare()
         functions["prepare_steam_layout"].assert_called_once()
-        functions["link_persistent"].assert_called_once_with(self.config, ctl.WINE_CONFIG_DIR)
+        functions["link_persistent"].assert_not_called()
+        functions["ensure_prefix"].assert_not_called()
+        functions["configure_headless_wine"].assert_not_called()
         functions["configure"].assert_not_called()
         self.assertEqual(sentinel.read_bytes(), b"keep")
 
-    def test_steam_layout_keeps_installer_destination_empty(self):
+    def test_steam_layout_creates_native_client_directory_without_wine_link(self):
         with mock.patch.object(ctl, "link_persistent") as link:
             ctl.prepare_steam_layout()
-        link.assert_called_once_with(self.library, self.steam)
+        link.assert_not_called()
+        self.assertTrue(self.steam.is_dir())
         self.assertFalse((self.steam / "steamapps").exists())
 
     def test_existing_steam_directory_is_not_migrated(self):
@@ -212,7 +233,7 @@ class InstallationTests(RuntimeFixture):
                 self.skipTest("Windows host requires symbolic-link privilege; Linux CI runs this test")
             raise
         directory = self.steam_install()
-        self.assertTrue(self.steam.is_symlink())
+        self.assertFalse(self.steam.is_symlink())
         self.assertEqual(ctl.steam_game_directory(), directory.resolve())
 
     def test_complete_steam_installation_is_resolved(self):
@@ -281,11 +302,11 @@ class InstallationTests(RuntimeFixture):
                 ctl.steam_game_directory()
 
     def test_custom_library_is_discovered(self):
-        custom = self.prefix / "drive_c" / "Games"
+        custom = self.home / "SteamGames"
         directory = self.steam_install(library=custom)
         metadata = self.steam / "steamapps/libraryfolders.vdf"
         metadata.parent.mkdir(parents=True)
-        metadata.write_text(r'"libraryfolders" { "0" { "path" "C:\\Games" "apps" { "2300320" "123" } } }')
+        metadata.write_text(f'"libraryfolders" {{ "0" {{ "path" "{custom.as_posix()}" "apps" {{ "2300320" "123" }} }} }}')
         self.assertEqual(ctl.steam_game_directory(), directory.resolve())
 
     def test_duplicate_installations_are_explicit(self):
@@ -356,38 +377,35 @@ class SteamMetadataTests(RuntimeFixture):
         with self.assertRaises(ValueError):
             ctl.read_vdf(path)
 
-    def test_c_drive_maps_to_this_prefix(self):
-        self.assertEqual(ctl.persistent_wine_path(r"C:\Steam"), (self.prefix / "drive_c/Steam").resolve())
+    def test_native_library_resolves_without_wine_prefix_mapping(self):
+        self.assertEqual(ctl.persistent_library_path(str(self.home / "Steam")), (self.home / "Steam").resolve())
 
     def test_relative_network_and_external_libraries_are_rejected(self):
         for value in ("relative", r"\\server\share", r"Z:\outside-container", r"D:\unmapped"):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                ctl.persistent_wine_path(value)
+                ctl.persistent_library_path(value)
 
 
 class SteamClientTests(RuntimeFixture):
-    def test_first_run_uses_official_client_installer(self):
-        installer = self.home / "SteamSetup.exe"
-        installer.touch()
-        with mock.patch.object(ctl, "STEAM_SETUP", installer):
-            self.assertEqual(ctl.steam_command(), ["wine", str(installer), "/S", r"/D=C:\Steam"])
+    def test_first_run_uses_native_linux_launcher(self):
+        self.assertEqual(ctl.steam_command(), [str(ctl.STEAM_LAUNCHER), "-cef-disable-gpu"])
 
     def test_saved_client_launch_has_no_credentials(self):
         self.steam.mkdir(parents=True)
         executable = self.steam / "steam.exe"
         executable.touch()
         with mock.patch.dict(os.environ, {"STEAM_PASSWORD": "secret", "STEAM_GUARD_CODE": "ABCDE"}):
-            self.assertEqual(ctl.steam_command(silent=True), ["wine", str(executable), "-cef-disable-gpu", "-silent"])
-            self.assertEqual(ctl.steam_command(), ["wine", str(executable), "-cef-disable-gpu"])
+            self.assertEqual(ctl.steam_command(silent=True), [str(ctl.STEAM_LAUNCHER), "-cef-disable-gpu", "-silent"])
+            self.assertEqual(ctl.steam_command(), [str(ctl.STEAM_LAUNCHER), "-cef-disable-gpu"])
 
-    def test_client_filename_case(self):
+    def test_windows_client_is_never_selected(self):
         self.steam.mkdir(parents=True)
         (self.steam / "Steam.exe").touch()
-        self.assertTrue(ctl.steam_executable().is_file())
+        self.assertEqual(ctl.steam_executable(), ctl.STEAM_LAUNCHER)
 
     def test_missing_installer_is_reported(self):
-        with mock.patch.object(ctl, "STEAM_SETUP", self.home / "missing.exe"):
-            with self.assertRaisesRegex(RuntimeError, "installer is missing"):
+        with mock.patch.object(ctl, "STEAM_LAUNCHER", self.home / "missing"):
+            with self.assertRaisesRegex(RuntimeError, "launcher is missing"):
                 ctl.steam_command()
 
     def test_giants_mode_does_not_open_steam(self):
@@ -445,8 +463,8 @@ class SteamClientTests(RuntimeFixture):
             self.assertFalse(ctl.steam_session_ready(directory))
         run.assert_not_called()
 
-    def test_shutdown_does_not_bootstrap_a_missing_client(self):
-        with mock.patch.object(ctl.subprocess, "run") as run:
+    def test_shutdown_does_not_bootstrap_a_missing_launcher(self):
+        with mock.patch.object(ctl, "STEAM_LAUNCHER", self.home / "missing"), mock.patch.object(ctl.subprocess, "run") as run:
             ctl.shutdown_steam()
         run.assert_not_called()
 
@@ -462,8 +480,7 @@ class SteamClientTests(RuntimeFixture):
 class SteamGuiLaunchTests(RuntimeFixture):
     def client_fixture(self):
         self.steam.mkdir(parents=True)
-        client = self.steam / "steam.exe"
-        client.touch()
+        client = ctl.STEAM_LAUNCHER
         os.environ["INSTALL_SOURCE"] = "steam"
         return client
 
@@ -481,50 +498,42 @@ class SteamGuiLaunchTests(RuntimeFixture):
         self.assertNotIn("-cef-disable-gpu", ctl.steam_command())
         self.assertNotIn("-cef-disable-sandbox", ctl.steam_command())
 
-    def test_context_selects_client_cwd_and_visible_errors_without_mutating_parent(self):
+    def test_context_selects_native_client_without_mutating_parent(self):
         client = self.client_fixture()
         os.environ["WINEDEBUG"] = "-all"
         command, cwd, environment = ctl.steam_launch_context()
-        self.assertEqual(command[1], str(client))
-        self.assertEqual(cwd, client.parent)
-        self.assertEqual(environment["WINEDEBUG"], "-all,err+all")
-        self.assertEqual(environment["PROTON_DISABLE_LSTEAMCLIENT"], "1")
+        self.assertEqual(command[0], str(client))
+        self.assertEqual(cwd, self.home)
+        self.assertNotIn("WINEDEBUG", environment)
+        self.assertNotIn("PROTON_DISABLE_LSTEAMCLIENT", environment)
         self.assertEqual(os.environ["WINEDEBUG"], "-all")
 
-    def test_context_preserves_explicit_import_diagnostics(self):
+    def test_native_client_does_not_inherit_wine_import_diagnostics(self):
         self.client_fixture()
         trace = "+timestamp,+pid,+module,+loaddll"
         os.environ["WINEDEBUG"] = trace
-        self.assertEqual(ctl.steam_launch_context()[2]["WINEDEBUG"], trace)
+        self.assertNotIn("WINEDEBUG", ctl.steam_launch_context()[2])
 
-    def test_installer_context_does_not_receive_cef_flags(self):
-        installer = self.home / "tools/SteamSetup.exe"
-        installer.parent.mkdir()
-        installer.touch()
-        with mock.patch.object(ctl, "STEAM_SETUP", installer):
-            command, cwd, environment = ctl.steam_launch_context(silent=True)
-        self.assertEqual(cwd, installer.parent)
-        self.assertEqual(command, ["wine", str(installer), "/S", r"/D=C:\Steam"])
-        self.assertEqual(environment["WINEDEBUG"], "-all,err+all")
+    def test_first_native_launch_uses_cef_flags_not_windows_installer(self):
+        command, cwd, environment = ctl.steam_launch_context()
+        self.assertEqual(cwd, self.home)
+        self.assertEqual(command, [str(ctl.STEAM_LAUNCHER), "-cef-disable-gpu"])
+        self.assertNotIn("WINEDEBUG", environment)
 
     def test_desktop_launch_passes_same_directory_and_environment(self):
         self.client_fixture()
         with mock.patch.object(ctl, "prepare"), mock.patch.object(ctl.os, "chdir") as chdir, \
                 mock.patch.object(ctl.os, "execvpe") as execute:
             ctl.open_steam()
-        chdir.assert_called_once_with(self.steam)
+        chdir.assert_called_once_with(self.home)
         self.assertIn("-cef-disable-gpu", execute.call_args.args[1])
-        self.assertEqual(execute.call_args.args[2]["WINEDEBUG"], "-all,err+all")
+        self.assertNotIn("WINEDEBUG", execute.call_args.args[2])
 
     def test_launch_context_uses_the_selected_command_even_if_installation_changes(self):
-        installer = self.home / "tools/SteamSetup.exe"
-        installer.parent.mkdir()
-        installer.touch()
-        with mock.patch.object(ctl, "STEAM_SETUP", installer), \
-                mock.patch.object(ctl, "steam_executable", side_effect=[None, self.steam / "steam.exe"]) as check:
+        with mock.patch.object(ctl, "steam_executable", side_effect=[ctl.STEAM_LAUNCHER, None]) as check:
             command, cwd, environment = ctl.steam_launch_context()
-        self.assertEqual(command[1], str(installer))
-        self.assertEqual(cwd, installer.parent)
+        self.assertEqual(command[0], str(ctl.STEAM_LAUNCHER))
+        self.assertEqual(cwd, self.home)
         self.assertEqual(check.call_count, 1)
 
     def test_automatic_launch_uses_same_headless_client_context(self):
@@ -532,8 +541,8 @@ class SteamGuiLaunchTests(RuntimeFixture):
         run, spawn = EntrypointTests.main_fixture(self, "steam", installed=True, mode="false")
         self.assertEqual(entry.main(), 0)
         call = next(call for call in spawn.call_args_list if call.args[1] == "steam-launch.log")
-        self.assertEqual(call.kwargs["cwd"], self.steam)
-        self.assertEqual(call.kwargs["process_env"]["WINEDEBUG"], "-all,err+all")
+        self.assertEqual(call.kwargs["cwd"], self.home)
+        self.assertNotIn("WINEDEBUG", call.kwargs["process_env"])
         self.assertIn("-cef-disable-gpu", call.args[0])
         self.assertNotIn("-silent", call.args[0])
 
@@ -636,8 +645,6 @@ class EntrypointTests(RuntimeFixture):
 
     def main_fixture(self, source, *, installed=False, mode="web_only", ready=True):
         os.environ.update({"INSTALL_SOURCE": source, "AUTOSTART_SERVER": mode, "AUTO_INSTALL_DLC": "true", "AUTO_INSTALL": "true"})
-        installer = self.home / "SteamSetup.exe"
-        installer.touch()
         if installed:
             if source == "steam":
                 self.steam_install()
@@ -651,7 +658,6 @@ class EntrypointTests(RuntimeFixture):
         server.wait.return_value = 0
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(mock.patch.object(ctl, "STEAM_SETUP", installer))
         stack.enter_context(mock.patch.object(ctl, "configure_runtime"))
         stack.enter_context(mock.patch.object(ctl, "configure_terminal"))
         stack.enter_context(mock.patch.object(ctl, "webserver_running", return_value=False))
@@ -720,10 +726,12 @@ class DesktopServerTests(RuntimeFixture):
     def start_fixture(self, *, session=True, web=False, game=False):
         os.environ["INSTALL_SOURCE"] = "steam"
         directory = self.steam_install()
+        self.proton_fixture(directory)
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(mock.patch.object(ctl, "prepare"))
         stack.enter_context(mock.patch.object(ctl, "steam_session_ready", return_value=session))
+        stack.enter_context(mock.patch.object(ctl, "prepare_proton_config"))
         stack.enter_context(mock.patch.object(ctl, "webserver_running", return_value=web))
         stack.enter_context(mock.patch.object(ctl, "game_server_running", return_value=game))
         chdir = stack.enter_context(mock.patch.object(ctl.os, "chdir"))
@@ -752,7 +760,10 @@ class DesktopServerTests(RuntimeFixture):
         directory, chdir, execute = self.start_fixture()
         self.assertEqual(ctl.start_webserver(), 0)
         chdir.assert_not_called()
-        execute.assert_called_once_with(["wine", str(directory / "dedicatedServer.exe")], cwd=directory.resolve())
+        self.assertEqual(execute.call_args.args[0][2:], ["run", str(directory.resolve() / "dedicatedServer.exe")])
+        self.assertTrue(execute.call_args.args[0][1].endswith("proton"))
+        self.assertEqual(execute.call_args.kwargs["cwd"], directory.resolve())
+        self.assertEqual(execute.call_args.kwargs["env"]["PROTON_DISABLE_LSTEAMCLIENT"], "0")
         self.assertEqual((directory / "steam_appid.txt").read_bytes(), b"2300320\n")
         self.assertTrue((directory / "dedicatedServer.xml").is_file())
 
@@ -823,7 +834,7 @@ class ReviewRegressionTests(RuntimeFixture):
         self.assertEqual(set(directory.rglob("*")), before)
 
 
-class WindowsSteamRuntimeTests(RuntimeFixture):
+class StandaloneWineRuntimeTests(RuntimeFixture):
     def test_cached_selection_still_disables_linux_steam_bridge(self):
         os.environ["_FS25_RUNTIME_READY"] = "1"
         ctl.select_wine_runtime()
@@ -845,7 +856,7 @@ class WindowsSteamRuntimeTests(RuntimeFixture):
         self.assertEqual(os.environ["WINESERVER"], str(runtime / "bin/wineserver"))
 
     def test_bridge_is_disabled_before_prefix_boot_and_preserves_data(self):
-        os.environ.update({"INSTALL_SOURCE": "steam", "_FS25_RUNTIME_READY": "1"})
+        os.environ.update({"INSTALL_SOURCE": "giants", "_FS25_RUNTIME_READY": "1"})
         self.steam.mkdir(parents=True)
         saved = self.steam / "loginusers.vdf"
         saved.write_bytes(b"saved session fixture")
@@ -860,7 +871,7 @@ class WindowsSteamRuntimeTests(RuntimeFixture):
             ctl.prepare()
         self.assertEqual(saved.read_bytes(), b"saved session fixture")
 
-    def test_game_api_probe_inherits_windows_steam_configuration(self):
+    def test_game_api_probe_reenables_linux_steam_bridge(self):
         directory = self.session_fixture()
         os.environ["_FS25_RUNTIME_READY"] = "1"
         ctl.configure_runtime()
@@ -868,7 +879,163 @@ class WindowsSteamRuntimeTests(RuntimeFixture):
                    subprocess.CompletedProcess([], 0, "STEAM_SESSION_READY\n", "")]
         with mock.patch.object(ctl.subprocess, "run", side_effect=results) as run:
             self.assertTrue(ctl.steam_session_ready(directory))
-        self.assertEqual(run.call_args.kwargs["env"].get("PROTON_DISABLE_LSTEAMCLIENT"), "1")
+        self.assertEqual(run.call_args.kwargs["env"].get("PROTON_DISABLE_LSTEAMCLIENT"), "0")
+
+
+class LinuxSteamIntegrationTests(RuntimeFixture):
+    def test_steam_runtime_configuration_skips_standalone_wine(self):
+        os.environ["INSTALL_SOURCE"] = "steam"
+        with mock.patch.object(ctl, "select_wine_runtime") as wine:
+            ctl.configure_runtime()
+        wine.assert_not_called()
+
+    def test_first_gui_prepare_does_not_create_or_boot_wine_prefix(self):
+        os.environ["INSTALL_SOURCE"] = "steam"
+        with mock.patch.object(ctl, "ensure_prefix") as boot, mock.patch.object(ctl, "select_wine_runtime") as wine, mock.patch.object(ctl, "configure_terminal"):
+            ctl.prepare()
+        boot.assert_not_called()
+        wine.assert_not_called()
+        self.assertFalse(self.prefix.exists())
+        self.assertTrue(self.steam.is_dir())
+        self.assertIn("fs25ctl.py steam", (ctl.DESKTOP_DIR / "fs25-steam.desktop").read_text())
+
+    def test_native_gui_environment_retains_desktop_not_wine(self):
+        os.environ.update({"DISPLAY": ":0", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/session", "WINEPREFIX": "old-prefix", "WINESERVER": "old-wineserver", "WINEDLLPATH": "old-dlls", "PROTON_DISABLE_LSTEAMCLIENT": "1", "LD_LIBRARY_PATH": "old-libs", "SteamAppId": "480", "PATH": str(ctl.PROTON_DIR / "bin") + os.pathsep + "/usr/bin"})
+        command, cwd, environment = ctl.steam_launch_context()
+        self.assertEqual(command[0], str(ctl.STEAM_LAUNCHER))
+        self.assertEqual(cwd, self.home)
+        self.assertEqual(environment["DISPLAY"], ":0")
+        self.assertEqual(environment["DBUS_SESSION_BUS_ADDRESS"], "unix:path=/tmp/session")
+        self.assertEqual(environment["PATH"], "/usr/bin")
+        for key in ("WINEPREFIX", "WINESERVER", "WINEDLLPATH", "PROTON_DISABLE_LSTEAMCLIENT", "LD_LIBRARY_PATH", "SteamAppId"):
+            self.assertNotIn(key, environment)
+        self.assertEqual(os.environ["PROTON_DISABLE_LSTEAMCLIENT"], "1")
+
+    def test_failed_native_launcher_preserves_novnc(self):
+        run, spawn = EntrypointTests.main_fixture(self, "steam", mode="true")
+        spawn.side_effect = [mock.Mock(), OSError("launcher missing")]
+        self.assertEqual(entry.main(), 0)
+        self.assertFalse(entry.steam_started)
+        self.assertFalse(any(call.args[1] == "dedicated-server.log" for call in spawn.call_args_list))
+
+    def test_proton_uses_tool_and_prefix_recorded_by_first_game_launch(self):
+        directory = self.steam_install()
+        tool, data = self.proton_fixture(directory)
+        os.environ.update({"WINESERVER": "old-server", "WINEPREFIX": "old-prefix", "WINEDLLPATH": "old-dlls", "PROTON_DISABLE_LSTEAMCLIENT": "1"})
+        command, environment = ctl.proton_launch_context(directory, ["dedicatedServer.exe"])
+        self.assertEqual(command, [sys.executable, str(tool.resolve() / "proton"), "run", "dedicatedServer.exe"])
+        self.assertEqual(environment["STEAM_COMPAT_DATA_PATH"], str(data.resolve()))
+        self.assertEqual(environment["STEAM_COMPAT_CLIENT_INSTALL_PATH"], str(self.steam.resolve()))
+        self.assertEqual(environment["PROTON_DISABLE_LSTEAMCLIENT"], "0")
+        self.assertEqual(environment["SteamAppId"], "2300320")
+        for key in ("WINESERVER", "WINEPREFIX", "WINEDLLPATH"):
+            self.assertNotIn(key, environment)
+
+    def test_missing_first_run_metadata_stops_server_without_creating_prefix(self):
+        directory = self.steam_install()
+        with self.assertRaisesRegex(ctl.SteamNotReady, "start FS25 once"):
+            ctl.proton_launch_context(directory, ["dedicatedServer.exe"])
+        self.assertFalse((directory.parent.parent / "compatdata").exists())
+
+    def test_partial_or_wine_only_tool_is_not_full_proton(self):
+        directory = self.steam_install()
+        tool, data = self.proton_fixture(directory)
+        for filename in ("proton", "files/bin/wine", "files/bin/wineserver", "files/lib/wine/x86_64-unix/lsteamclient.so"):
+            with self.subTest(filename=filename):
+                path = tool / filename
+                contents = path.read_bytes()
+                path.unlink()
+                with self.assertRaises(ctl.SteamNotReady):
+                    ctl.proton_launch_context(directory, ["server.exe"])
+                path.write_bytes(contents)
+
+    def test_malformed_or_external_proton_record_is_pending(self):
+        directory = self.steam_install()
+        tool, data = self.proton_fixture(directory)
+        for contents in ("", "one-line", "version\nfonts\nrelative/files/lib\n", "version\nfonts\n/outside/files/lib\n", "x" * 65537):
+            with self.subTest(contents=contents[:30]):
+                (data / "config_info").write_text(contents)
+                with self.assertRaises(ctl.SteamNotReady):
+                    ctl.proton_launch_context(directory, ["server.exe"])
+
+    def test_custom_native_library_keeps_its_own_compatdata(self):
+        directory = self.steam_install(library=self.home / "Games")
+        tool, data = self.proton_fixture(directory)
+        command, environment = ctl.proton_launch_context(directory, ["server.exe"])
+        self.assertEqual(pathlib.Path(environment["STEAM_COMPAT_DATA_PATH"]), data.resolve())
+        self.assertEqual(environment["STEAM_COMPAT_LIBRARY_PATHS"], str(directory.parent.parent.parent))
+
+    def test_proton_diagnostics_are_preserved_only_for_game(self):
+        directory = self.steam_install()
+        self.proton_fixture(directory)
+        os.environ.update({"PROTON_LOG": "1", "WINEDEBUG": "+module", "PROTON_USE_WINED3D": "1"})
+        _, environment = ctl.proton_launch_context(directory, ["server.exe"])
+        self.assertEqual(environment["PROTON_LOG"], "1")
+        self.assertEqual(environment["WINEDEBUG"], "+module")
+        self.assertEqual(environment["PROTON_USE_WINED3D"], "1")
+        self.assertNotIn("PROTON_LOG", ctl.steam_launch_context()[2])
+
+    def test_game_defaults_are_backed_up_without_overwriting_server_data(self):
+        directory = self.steam_install()
+        tool, data = self.proton_fixture(directory)
+        _, environment = ctl.proton_launch_context(directory, ["server.exe"])
+        target = data / "pfx/drive_c/users/steamuser/Documents/My Games/FarmingSimulator2025"
+        target.mkdir(parents=True)
+        (target / "game.xml").write_bytes(b"first-run defaults")
+        (target / "savegame1").mkdir()
+        (target / "savegame1/careerSavegame.xml").write_bytes(b"savegame")
+        self.config.mkdir(parents=True)
+        (self.config / "game.xml").write_bytes(b"server settings")
+        with mock.patch.object(pathlib.Path, "symlink_to") as link:
+            ctl.prepare_proton_config(environment)
+        link.assert_called_once_with(self.config, target_is_directory=True)
+        self.assertEqual((self.config / "game.xml").read_bytes(), b"server settings")
+        self.assertEqual((self.config / "savegame1/careerSavegame.xml").read_bytes(), b"savegame")
+        self.assertEqual((target.with_name(target.name + ".before-fs25-link") / "game.xml").read_bytes(), b"first-run defaults")
+
+    def test_old_windows_client_and_login_are_never_modified(self):
+        old = self.prefix / "drive_c/Steam/config/loginusers.vdf"
+        old.parent.mkdir(parents=True)
+        old.write_bytes(b"old login")
+        old_game = self.home / "steam/library/steamapps/old-download"
+        old_game.parent.mkdir(parents=True)
+        old_game.write_bytes(b"download")
+        ctl.prepare_steam_layout()
+        ctl.steam_launch_context()
+        self.assertEqual(old.read_bytes(), b"old login")
+        self.assertEqual(old_game.read_bytes(), b"download")
+
+    def test_shutdown_is_native_and_has_clean_environment(self):
+        os.environ["PROTON_DISABLE_LSTEAMCLIENT"] = "1"
+        with mock.patch.object(ctl.subprocess, "run") as execute:
+            ctl.shutdown_steam()
+        self.assertEqual(execute.call_args.args[0], [str(ctl.STEAM_LAUNCHER), "-shutdown"])
+        self.assertNotIn("PROTON_DISABLE_LSTEAMCLIENT", execute.call_args.kwargs["env"])
+
+    def test_api_conversion_and_probe_use_identical_full_proton_environment(self):
+        directory = self.session_fixture()
+        os.environ["PROTON_LOG"] = "1"
+        results = [subprocess.CompletedProcess([], 0, "Z:\\game\\steam_api64.dll", ""), subprocess.CompletedProcess([], 0, "STEAM_SESSION_READY\n", "")]
+        with mock.patch.object(ctl, "prepare_proton_config") as config, mock.patch.object(ctl.subprocess, "run", side_effect=results) as execute:
+            self.assertTrue(ctl.steam_session_ready(directory))
+        config.assert_not_called()
+        conversion, probe = execute.call_args_list
+        self.assertEqual(conversion.args[0][2], "getcompatpath")
+        self.assertEqual(probe.args[0][2], "run")
+        self.assertEqual(conversion.args[0][:2], probe.args[0][:2])
+        self.assertEqual(conversion.kwargs["env"], probe.kwargs["env"])
+        self.assertEqual(conversion.kwargs["env"]["PROTON_DISABLE_LSTEAMCLIENT"], "0")
+        self.assertNotIn("PROTON_LOG", probe.kwargs["env"])
+
+    def test_image_installs_pinned_native_launcher_and_32bit_libraries(self):
+        source = (SOURCE / "Dockerfile").read_text()
+        self.assertIn("steam-launcher_1.0.0.87_amd64.deb", source)
+        self.assertIn("765aba9a0ed339a50226ceb614fcc9879a991ba184098bc8de920efb12c714a4", source)
+        self.assertIn("libc6:i386", source)
+        self.assertIn("test -x /usr/bin/steam", source)
+        self.assertIn("/tmp/steam-libs-amd64.deb /tmp/steam-libs-i386.deb", source)
+        self.assertIn("rm -f /etc/apt/sources.list.d/steam-stable.list", source)
+        self.assertNotIn("SteamSetup.exe", source)
 
 
 class DockerSmokeOwnershipTests(unittest.TestCase):

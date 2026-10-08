@@ -1,7 +1,7 @@
 # FS25 Pelican
 
 Run a Farming Simulator 25 dedicated server on Pelican or Pterodactyl.
-Install using a GIANTS Windows installer or the normal Windows Steam client.
+Install using a GIANTS Windows installer or native Linux Steam with Proton.
 Both use a browser-accessible noVNC desktop. Game files, settings, mods,
 savegames and Steam's saved session persist between container restarts.
 
@@ -37,16 +37,18 @@ different public address. Open the noVNC link printed after starting the server.
 ### Steam
 
 1. Set `INSTALL_SOURCE=steam` and `AUTOSTART_SERVER=false` for the initial setup.
-2. Start the container and open noVNC. The normal Windows Steam client is
-   installed at `C:\Steam` and launched. Its first update can take a few minutes.
+2. Start the container and open noVNC. Native Linux Steam opens and updates
+   itself on the first start. Its first update can take a few minutes.
 3. Sign in **inside Steam**, complete Steam Guard there and enable **Remember me**.
    The egg has no Steam username, password or Steam Guard fields.
    Use the **Steam** desktop shortcut to bring the client back if needed.
-4. Install **Farming Simulator 25** in Steam's default library. In
+4. In **Library → FS25 → Properties → Compatibility**, select **Proton 11**.
+   Steam downloads the complete Proton tool and FS25's Windows version.
+   Install **Farming Simulator 25** in Steam's default library. In
    **Library → FS25 → Properties → DLC**, enable the game DLCs you want and
    wait until all downloads finish.
-5. Launch FS25 once through Steam to complete first-run prerequisites, then
-   close the game. Keep Steam itself running.
+5. Launch FS25 once through Steam to create its Proton prefix and complete
+   first-run prerequisites, then close the game. Keep Steam itself running.
 6. Set `AUTOSTART_SERVER=web_only` or `true` and restart the container.
 
 The image prepares `steam_appid.txt` with FS25's App ID, `2300320`, before
@@ -61,9 +63,11 @@ container after signing in.
 Existing GIANTS installations are kept when selecting Steam; Steam downloads
 its own copy. Both methods share your server settings, mods and savegames.
 
-If Steam reports an installation error, update to the rebuilt image, fully
-stop/start the container and reopen Steam. Keep your existing Steam files and
-Wine prefix; do not delete them to retry the login.
+When upgrading from the old Windows Steam client, pull the rebuilt image and
+fully stop/start the container. Sign in once in Linux Steam; the old Windows
+client and its saved session stay untouched. To reuse an existing download,
+add `/home/container/steam/library` in **Steam Settings → Storage** and let
+Steam verify the files. Do not copy Windows client files into Linux Steam.
 
 ## Start and configure the server
 
@@ -89,8 +93,9 @@ game instance alongside the dedicated server.
 | Data | Location |
 | --- | --- |
 | GIANTS game installation | `/home/container/game/Farming Simulator 2025` |
-| Default Steam client/library | `/home/container/steam/library` (`C:\Steam`) |
-| Wine prefix | `/home/container/.fs25server` |
+| Linux Steam client/default library | `/home/container/.local/share/Steam` |
+| Steam FS25 Proton prefix | `steamapps/compatdata/2300320/pfx` in the chosen library |
+| GIANTS Wine prefix | `/home/container/.fs25server` |
 | Settings | `/home/container/config/FarmingSimulator2025` |
 | Mods | `/home/container/config/FarmingSimulator2025/mods` |
 | Savegames | `/home/container/config/FarmingSimulator2025/savegameN` |
@@ -105,7 +110,7 @@ Finish downloads before starting a savegame that needs those DLCs.
 
 ## Updates and backups
 
-Before updating, stop the container and back up the Wine prefix, game/Steam
+Before updating, stop the container and back up the Wine/Proton prefix, game/Steam
 installation and configuration folder. Pull the new image and restart.
 Existing GIANTS servers keep their installation method; update the egg to
 expose the new Steam selection.

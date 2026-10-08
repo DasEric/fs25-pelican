@@ -1,5 +1,5 @@
 /* Probe the installed game's Steam API without launching the game or logging in.
- * This executable runs under the same Wine prefix/user as Steam and FS25.
+ * This executable runs under FS25's full Proton and bridges to native Linux Steam.
  * Copyright (c) 2026 Eric (DasEric). MIT, see LICENSE.
  */
 #define WIN32_LEAN_AND_MEAN

@@ -1,265 +1,187 @@
 # Maintainer guide
 
-The [README](../README.md) covers normal panel use. This document covers runtime
-implementation, diagnostics and release verification.
+The [README](../README.md) covers normal panel use. This document describes
+runtime selection, diagnostics and release verification.
 
-## Runtime and persistence
+## Two independent runtime paths
 
-The image runs as the unprivileged `container` user. `entrypoint.py` owns desktop
-startup and process supervision; `fs25ctl.py` owns installation, configuration
-and manually invoked desktop actions. Both select `INSTALL_SOURCE=giants` by
-default and reject unknown installation sources.
+`INSTALL_SOURCE=giants` retains the standalone Wine installation and persistent
+prefix `/home/container/.fs25server`. `INSTALL_SOURCE=steam` starts **native
+Linux Steam**, then uses the **full Proton tool downloaded by Steam** for FS25.
+The two Wine distributions and their prefixes must not be combined.
 
-The Wine prefix stays at `/home/container/.fs25server`. GIANTS installation
-keeps its existing Program Files link. In Steam mode, a new `C:\Steam` points
-at `/home/container/steam/library`, containing the normal Windows client,
-session files and its default `steamapps` library. An already existing
-`C:\Steam` directory is preserved, not migrated. Steam's native login data is
-never extracted or copied into egg variables. Additional libraries are read
-from the client's `libraryfolders.vdf` and must resolve inside `/home/container`.
-Unmapped/external library entries are skipped with a console message so they
-do not hide a finished installation in another persistent library.
+The official Valve `steam-launcher` Debian package is versioned and SHA-256
+pinned in the Dockerfile. Its dependencies and the native 32-bit graphics/C
+libraries are installed at image build time. Its self-update runs as `container`,
+not root. The image contains no Steam account, remembered login or game files.
+Linux Steam stores its client, logs, default library and full Proton downloads
+in persistent `/home/container/.local/share/Steam`. Steam's other HOME data,
+including `.steam`, also persists. Do not relocate its client behind its back.
+The launcher's bundled apt sources are removed after installing the pinned
+launcher and dependency metapackages. Otherwise, cleaned apt indexes cause
+steamdeps to prompt for a privileged apt update at runtime. Portal backends
+and bubblewrap are installed in the image as well.
 
-Both sources link the Wine user's FS25 Documents directory to the existing
-configuration folder. Switching source keeps game installations separate but
-shares settings, mods and savegames. Back up the configuration before running
-a different game version against an existing savegame.
+Steam GUI startup does not run Wine, repair a prefix, or require FS25/Proton to
+be installed. Desktop and panel launches share the same native command and
+clean environment. Inherited GIANTS Wine binaries, DLL overrides, loader paths,
+Steam App IDs and Proton variables are removed from the client environment;
+DISPLAY, XDG runtime and the desktop session bus remain available. CEF uses
+`-cef-disable-gpu` for Xvnc by default; `FS25_STEAM_GPU=true` opts into GPU use.
+The CEF sandbox is not disabled by the controller.
 
-Steam owns its manifests and depot/DLC layout. Installation readiness requires
+The native client updates itself normally. A versioned installer URL avoids
+unrelated upstream launcher changes breaking a reproducible build.
+References: [Valve's launcher repository](https://repo.steampowered.com/steam/),
+[Valve's CEF GPU recommendation](https://github.com/ValveSoftware/steam-for-linux/issues/11610).
+
+## FS25's Proton installation and server launch
+
+Users select Proton 11 in **FS25 Properties > Compatibility**, complete all
+game/DLC/tool downloads, and start FS25 once in Steam before closing the game.
+This obtains the Windows game depots and creates Steam's app-specific prefix.
+No client, manifest, compatibility mapping or depot is fabricated by the controller.
+
+Library discovery reads native `libraryfolders.vdf`. Libraries, games, tools
+and compatdata must remain under persistent HOME. Readiness requires
 `appmanifest_2300320.acf`, `StateFlags=4`, finished download/staging counters,
-no remaining download files, the launcher, dedicated server, game engine and
-Steam API DLL. This does not enumerate the account's purchases: operators must
-check the desired DLC selection and completed downloads in Steam. DLCs are
-never copied blindly into the GIANTS `pdlc` directory.
+no remaining download files, and the Windows launcher, dedicated server,
+game engine and Steam API DLL. Desired DLCs are selected in Steam; they are
+not copied into the GIANTS `pdlc` directory.
 
-The official Windows Steam bootstrap is pinned in the Dockerfile. If Valve
-replaces the installer at its CDN URL, review the official installer and update
-its checksum. An installed client updates itself normally in its persistent
-directory. No account, game files or remembered login is included in the image.
+The exact previously used Proton tool is resolved from Steam's first-run
+`steamapps/compatdata/2300320/config_info` record. Valve records the Wine prefix
+version, fonts directory, library directory and Steam directory there.
+The controller validates its full `proton` launcher, Wine/wineserver binaries,
+64-bit `lsteamclient.so` bridge and initialized prefix. Missing/partial tools
+produce pending status, never a fallback to standalone Wine. If the user
+changes the compatibility tool, launch FS25 through Steam once again first.
 
-## Steam session and startup
+Both the Steam API probe and dedicated server run via that Proton launcher
+with the same `STEAM_COMPAT_DATA_PATH`, `STEAM_COMPAT_CLIENT_INSTALL_PATH`,
+`STEAM_COMPAT_INSTALL_PATH`, Steam App ID and game working directory.
+`PROTON_DISABLE_LSTEAMCLIENT=0` enables the bridge to the native Linux client.
+Inherited Wine loaders, prefixes and DLL paths are cleared. Proton manages its
+own libraries; `/opt/fs25/wine-compat` is an additional private ABI lookup path
+for server subprocesses, not a global desktop library override.
 
-Steam login and Steam Guard happen exclusively in the normal Steam UI through
-noVNC. There is no SteamCMD login, credential forwarding, console-code parser,
-stored Guard code or desktop click automation.
+The dedicated-server path invokes `proton run` inside the existing Pelican
+container, rather than nesting Steam's pressure-vessel game container. This
+host-library path needs live validation for the selected Proton release.
+Steam's normal first game launch and native webhelper can use Steam Runtime;
+their namespace/runtime requirements must also be verified on the actual node.
+A mock test or the GIANTS Wine build smoke is not proof that those paths work.
 
-`steam_session.c` is a small Windows executable compiled in a separate build
-stage with MinGW. The final image includes neither MinGW nor Steam SDK files.
-Toolchain runtime notices are retained in `/opt/fs25/steam-probe-licenses`.
-The probe loads the installed game's own `steam_api64.dll`, calls the documented
-flat Steam API initialization/user interfaces and `BLoggedOn`, then shuts the
-API down. It never calls `SteamAPI_RestartAppIfNecessary` or launches the game.
-Supported exported SteamUser versions are selected from the DLL itself.
+References: [Valve Proton](https://github.com/ValveSoftware/Proton),
+[Proton prefix/environment implementation](https://github.com/ValveSoftware/Proton/blob/proton_11.0/proton),
+[Linux Steam bridge](https://github.com/ValveSoftware/Proton/blob/proton_11.0/lsteamclient/Makefile.in).
 
-Probe results:
+## Settings, migration and session readiness
+
+Server settings/mods/savegames remain in
+`/home/container/config/FarmingSimulator2025`. Steam's Windows user is
+`steamuser`: the corresponding Proton Documents folder is linked there, not
+to a guessed Linux-user Wine folder. Existing server data takes priority.
+First-game-launch defaults are retained beside that Documents folder as
+`FarmingSimulator2025.before-fs25-link`; only missing data is imported.
+
+Older Windows Steam clients, libraries, account files and GIANTS prefixes are
+not deleted or moved. Users sign into native Linux Steam once. Existing game
+downloads can be added through **Steam Settings > Storage** and verified by
+Steam; unregistered Windows libraries are not assumed to belong to Linux Steam.
+Do not copy Windows client/session files into the native client directory.
+
+Login and Steam Guard happen in noVNC, exclusively in Steam's own UI. There
+are no egg credentials, SteamCMD login or desktop click-automation scripts.
+Saved login files are not proof of a running authenticated session.
+
+`steam_session.c` loads the game's own `steam_api64.dll`, calls SteamAPI_Init
+and the exported SteamUser interface/BLoggedOn, then shuts the API down. It
+never calls SteamAPI_RestartAppIfNecessary or launches FS25. Proton converts
+the API DLL path using `getcompatpath`; conversion and probe share a timeout.
 
 | Exit | Output | Meaning |
 | --- | --- | --- |
-| `0` | `STEAM_SESSION_READY` | Steam API initialized and the user is logged on |
-| `1` | `STEAM_SESSION_PENDING` | Client/login/online session is pending |
-| `2` | `STEAM_API_*` | Missing argument, DLL load failure or unsupported API |
+| 0 | `STEAM_SESSION_READY` | API initialized and user logged on |
+| 1 | `STEAM_SESSION_PENDING` | Client/login/online session pending |
+| 2 | `STEAM_API_*` | DLL load/export/argument failure |
 
-The Python controller invokes the probe under the same Wine prefix/user as
-Steam and FS25. Path conversion and probing share the remaining timeout budget.
-It writes `steam_appid.txt` with
-ASCII `2300320` plus a newline into the game root and engine directory, and
-sets the working directory to the game root. Saved `loginusers.vdf` files are
-not treated as proof of a running authenticated session.
+The controller writes ASCII `2300320` plus a newline in `steam_appid.txt` in
+the game root and engine directory before startup. Existing wrong values
+are backed up. MinGW builds the helper in a separate image stage; toolchain
+runtime notices remain in `/opt/fs25/steam-probe-licenses`.
 
-On an uninstalled/partial first setup, only the desktop and Steam stay online.
-Complete downloads and first-run setup, close the game and restart. On a later
-start, autostart waits at most 180 seconds for the live Steam API check. Pending
-login or errors leave noVNC available instead of repeatedly restarting the
-container. `AUTOSTART_SERVER=false` intentionally skips the session probe.
+Initial/partial setup and `AUTOSTART_SERVER=false` open Steam visibly. Installed
+autostarts can use `-silent`; a desktop action opens it visibly again. Autostart
+waits at most 180 seconds for the API. Errors/pending setup leave noVNC online.
+Both panel and desktop starts use the controller's nonblocking Linux flock
+for the server's entire lifetime; competing starts exit before rewriting data.
+Pending setup/session/update or a competing managed start returns 75, other
+failures return 1, and normal server exit statuses are propagated.
+Server shutdown precedes native Steam `-shutdown` and desktop shutdown.
 
-The egg uses `/opt/fs25/fs25ctl.py start-webserver` as its source-neutral startup
-command. Panel and desktop starts both invoke this controller; the original
-fixed GIANTS startup command is normalized to it as well. Unrelated custom
-startup commands remain unchanged and do not acquire the controller's lock.
+## Diagnostics
 
-The controller holds a nonblocking Linux `flock` on
-`/home/container/.fs25-webserver.lock` throughout preparation and the Wine
-server's lifetime. A competing start exits before it prepares the prefix or
-rewrites configuration. The lock file stays in place and the kernel releases
-ownership when the controller exits. Never delete this file while a controller
-is running. Installation readiness is rechecked immediately before launch.
+The appended `/home/container/logs/steam-launch.log` includes a UTC launch
+marker, native backend, command, HOME, DISPLAY and working directory. Inspect
+Steam's own `bootstrap_log.txt`, `webhelper.txt` and `cef_log.txt` under
+`/home/container/.local/share/Steam/logs` if the window remains missing.
+Neither an updater nor an open terminal is proof that the UI is ready.
 
-Pending Steam setup/session/update and competing managed starts return status
-`75`. Other failures return `1`; server exit statuses are propagated. In Steam
-mode, failed launches leave noVNC available and cancel the pending automatic
-game-start helper. This also covers an update beginning after the first session
-check. A finished normal server stop still stops the container.
-
-Supervised server process groups are signalled even if their launcher has
-already exited. Forced shutdowns also wait for the child to be reaped. Server
-shutdown precedes Steam's normal `-shutdown` request and desktop shutdown. The desktop server action checks
-for an already running Web Interface/game process before starting another.
-
-References: [Steamworks initialization](https://partner.steamgames.com/doc/sdk/api),
-[ISteamUser / BLoggedOn](https://partner.steamgames.com/doc/api/ISteamUser),
-[DLC installation](https://partner.steamgames.com/doc/store/application/dlc),
-[official Steam download](https://store.steampowered.com/about/).
-
-## Wine selection and provenance
-
-The default is Kron4ek's prebuilt `wine-proton-11.0-2-amd64-wow64`, based on
-Valve Wine commit `dc26e61847081a1b5cb0733dc30feba6ee575482`. The Dockerfile pins
-the binary SHA-256 and build recipe commit
-`fe137c65b411ff3079d1b26573dcb70bf16814a5`. WineHQ 11 remains the `stable`
-compatibility option. Wine itself is not compiled by this project.
-
-This image runs the real Windows Steam client, not Linux Steam's Proton
-integration. `PROTON_DISABLE_LSTEAMCLIENT=1` is set in the image and enforced
-before runtime selection, including the already-selected desktop-child path.
-In the pinned Wine source, leaving this unset enables Steam DLL interception
-and redirects `tier0_s64.dll` / `vstdlib_s64.dll` imports from `steamclient64.dll`
-to `ntdll.dll`. Those redirects are inappropriate for our Windows client.
-See [the pinned loader source](https://github.com/ValveSoftware/wine/blob/dc26e61847081a1b5cb0733dc30feba6ee575482/dlls/ntdll/loader.c#L1151-L1211).
-
-The build smoke test loads synthetic Steam-named DLLs and their dependency
-in both Windows architectures. The 64-bit fixture specifically exercises the
-redirected `tier0_s64.dll` import; the 32-bit fixture verifies WoW64 dependency
-loading. These are loader tests, not a real Steam login or UI compatibility
-test. They run as `container` in the isolated smoke prefix and are removed
-afterwards. The C source also runs natively on Windows for regression tests.
-
-For an existing client reporting an installation error or
-`ClientAPI_InitGlobalInstance`, first deploy the rebuilt image and fully stop
-and restart the container. Reopen Steam in noVNC with autostart disabled.
-Keep the existing prefix, client, library and saved login. The log's generic
-32-bit-dependency message alone does not identify a missing Linux package.
-If the error persists, close Steam, then run the existing controller manually
-in the noVNC terminal with import diagnostics and retain the resulting log:
+Open the actual native client from the noVNC terminal:
 
 ```sh
-WINEDEBUG=+timestamp,+pid,+loaddll,+module /opt/fs25/fs25ctl.py steam > /home/container/logs/steam-imports.log 2>&1
+/opt/fs25/fs25ctl.py steam > /home/container/logs/steam-native.log 2>&1
 ```
 
-This manual command leaves the existing client/data intact. Inspect the first
-missing module, failed export or failed load in that log before changing
-packages. Font warnings alone do not establish the cause of client failure.
+To inspect the server/Proton path after first-run setup and with the normal
+game closed, run:
 
-Both automatic and desktop Steam starts use the client directory as working
-directory (the installer uses its own directory). They enable Wine errors by
-default while preserving an explicit diagnostic `WINEDEBUG` value. The launch
-log appends a UTC launch marker, arguments, working directory and relevant
-runtime flags; it is not overwritten on restart. This separates successive
-starts, but does not timestamp every line emitted by Steam itself.
-First/partial FS25 setup and `AUTOSTART_SERVER=false` launch the client visibly;
-`-silent` is reserved for installed game autostarts.
-
-Xvnc commonly has no render node. Steam's CEF GUI uses `-cef-disable-gpu` by
-default; `FS25_STEAM_GPU=true` restores its normal GPU path if desired. This
-does not change the FS25 game's graphics/synchronization options. It is a
-headless compatibility setting, not proof of a particular CEF crash.
-See [Valve's GPU-disabled launch recommendation](https://github.com/ValveSoftware/steam-for-linux/issues/11610).
-The image includes Liberation TrueType substitutes and refreshes Fontconfig.
-The build additionally measures text through Win32 GDI and creates/joins a
-Win32 worker thread in each architecture. Successful substitutes/text metrics
-are not a test of Steam's full CEF/DirectWrite UI or an authenticated login.
-
-For a missing Steam window, inspect `bootstrap_log.txt`, `webhelper.txt` and
-`cef_log.txt` inside `C:\Steam\logs` (normally
-`/home/container/steam/library/logs`). Host/launcher logs alone may not identify
-the failing client phase. The Linux shell command `steam` is not installed;
-use `/opt/fs25/fs25ctl.py steam` to open the Windows client. X connection loss
-can follow a container stop; an untimestamped worker-thread error adjacent to
-it does not by itself establish the initial startup cause.
-
-FFmpeg 4 ABI compatibility libraries come from Ubuntu 22.04 and remain private
-to Wine in `/opt/fs25/wine-compat`. Package versions and licenses are included.
-ELF search paths are changed only for Wine and those libraries; there is no
-global desktop library replacement. The build rejects unresolved dependencies.
-
-Stop the container before changing `/home/container/config/wine-runtime.json`:
-
-```json
-{"runtime": "proton", "sync": "auto"}
+```sh
+PROTON_LOG=1 /opt/fs25/fs25ctl.py start-webserver
 ```
 
-- Runtime: `proton` or `stable`.
-- Synchronization: `auto`, `fsync` or `server`.
-- Non-empty `FS25_WINE_RUNTIME` / `FS25_WINE_SYNC` override the respective values.
-- Selection occurs once per container lifetime and is inherited by Steam,
-  desktop, installer and server processes.
+The old `lsteamclient disabled` line was an intentional diagnostic from the
+Windows-client Wine path, not proof of the cause of the missing GUI. It is not
+part of native Linux Steam startup. Font warnings and X connection loss near
+container shutdown also do not establish the original failure.
 
-The isolated FSYNC probe checks `futex_waitv` and usable shared memory before
-Wine starts. Failed/blocked probes disable FSYNC rather than blocking startup.
-Wine may use accessible NTSync in `auto` mode. Environment flags and old logs
-are not proof of the backend actually in use. The open-file soft limit is raised
-to at most 65,536 without exceeding the inherited hard limit.
+For map-loading analysis, `/opt/fs25/fs25ctl.py diagnose --seconds 10` reads CPU,
+cgroup throttling, I/O and Wine sync descriptors. Use identical maps/mods,
+savegames, DLC versions and resource limits for comparisons.
 
-Wine's LGPL source/notices, exact source archive and builder recipe are in
-`/opt/fs25/wine-source`; `RUNTIME.txt` records provenance. Project sources,
-including the Steam session probe, are MIT-licensed.
+## GIANTS Wine and build verification
 
-References: [Wine-Proton binary](https://github.com/Kron4ek/Wine-Builds/releases/tag/proton-11.0-2),
-[build recipe](https://github.com/Kron4ek/Wine-Builds/tree/fe137c65b411ff3079d1b26573dcb70bf16814a5),
-[Wine source](https://github.com/ValveSoftware/wine/tree/dc26e61847081a1b5cb0733dc30feba6ee575482),
-[NTSync](https://docs.kernel.org/userspace-api/ntsync.html).
+GIANTS keeps Kron4ek `wine-proton-11.0-2-amd64-wow64`, source commit
+`dc26e61847081a1b5cb0733dc30feba6ee575482`, recipe commit
+`fe137c65b411ff3079d1b26573dcb70bf16814a5`, and pinned SHA-256. WineHQ 11 is
+the stable option. Source/notices are in `/opt/fs25/wine-source`. FFmpeg 4 ABI
+libraries and notices remain private in `/opt/fs25/wine-compat`.
 
-## Loading diagnostics
+`config/wine-runtime.json` (`{"runtime":"proton","sync":"auto"}`) and optional
+`FS25_WINE_RUNTIME`/`FS25_WINE_SYNC` affect GIANTS, not Steam's full Proton.
+The standalone loader keeps its Linux Steam hook disabled. Its build smoke
+tests exercise Wine x86/x64, synthetic Steam-named imports, text metrics,
+worker threads and API probe statuses; they do not run native Linux Steam.
 
-While the game loads a map, run this existing manual controller command in
-the noVNC terminal:
+Run `python -m unittest discover -s tests -v`. Tests use temporary directories
+and mocked subprocesses, no credentials. Linux CI also tests real flock.
+Optional native Windows fixtures use `FS25_TEST_NATIVE_PROBE`,
+`FS25_TEST_NATIVE_STUB`, `FS25_TEST_NATIVE_UNSUPPORTED`,
+`FS25_TEST_NATIVE_IMPORTS` and `FS25_TEST_NATIVE_GUI`.
 
-```text
-/opt/fs25/fs25ctl.py diagnose --seconds 10
-```
+Before release, verify on a real Linux AMD64 Pelican node:
 
-It reads process/thread CPU, cgroup quota/throttling, disk I/O, file descriptors
-and historical i3d timings from the last 256 KiB of the game log. It does not
-prepare the prefix, rewrite settings, restart processes or alter mods/caches.
-The game log is `/home/container/config/FarmingSimulator2025/log.txt`.
+1. Native first-run Steam UI, login/Guard, client update and remembered login.
+2. Steam Runtime/webhelper operation with the node's actual container settings.
+3. Proton first-run setup, matching game/tool/library/prefix and Windows depots.
+4. Live API check and dedicated-server launch; record missing host libraries.
+5. Old-library reuse, interrupted downloads, native custom libraries and DLCs.
+6. All autostart modes, no duplicate game/server, clean stop/restart.
+7. Settings/mod/savegame persistence, DLC-dependent join/rejoin and GIANTS regression.
 
-Compare at least three identical runs, separating first load from subsequent
-loads. Record CPU/storage, game/DLC versions, mod ZIPs, map and a copy of the same
-savegame. A busy single thread can indicate a sequential stage; cgroup throttling
-shows quota exhaustion, not every kind of host contention. Zero reads can reflect
-the page cache. Neither Wine-Proton nor FSYNC guarantees Windows-equivalent times.
-
-Empty optional egg variables preserve GIANTS settings. Ports always follow
-allocations. The old generated one-year Web API interval is migrated once to
-60 seconds; later GIANTS changes remain preserved. Web API refresh and engine
-disconnect timeout are separate. Set pause-when-empty in GIANTS and leave
-`SERVER_PAUSE` empty when GIANTS should own it.
-
-## Verification before release
-
-Run `python -m unittest discover -s tests -v`. The Python tests use temporary
-directories and mocked subprocesses, never real credentials or server data.
-Linux CI additionally tests real lock contention/release; Windows tests use a
-mock for `flock`, and the real Linux lock test is skipped there.
-Optional native tests use `FS25_TEST_NATIVE_PROBE`, `FS25_TEST_NATIVE_STUB` and
-`FS25_TEST_NATIVE_UNSUPPORTED` paths to compiled probe/test DLLs on Windows.
-`FS25_TEST_NATIVE_IMPORTS` optionally points to a directory containing
-`steam-import-32` and `steam-import-64`, each with the compiled import probe,
-Steam-named fixture and dependency DLL. These native tests also cover missing
-dependencies, Unicode paths and missing arguments.
-`FS25_TEST_NATIVE_GUI` can point to the same layout with `steam-gui-test.exe`
-in each architecture directory for native Windows text/thread tests.
-The Docker build compiles the probe and test DLLs and exercises readiness,
-offline and unsupported-API results under Wine, alongside both Windows command
-interpreters. Test DLLs and the smoke prefix are removed from the final image.
-
-These tests do not replace live FS25 acceptance. Before publishing, verify:
-
-1. New/existing GIANTS installation, activation, desktop and sequential DLCs.
-2. First Steam install, noVNC login/Guard, remembered login after recreation,
-   expired session, client update and client closed unexpectedly.
-3. Full/partial game downloads, resumed downloads, custom persistent library,
-   disk exhaustion and game-file verification.
-4. Desired DLC selection and a DLC-dependent savegame with join/rejoin.
-5. All autostart modes; Web Interface and desktop start actions; no double game.
-6. Game save/load, normal stop/restart, retained GIANTS settings and allocations.
-7. Steam game/DLC update with autostart disabled, then normal restart.
-
-The GitHub workflow publishes `latest` and a commit-specific tag when `main`
-changes. Validate a test image/server before merging or pushing to `main`.
-Do not present a stub test or successful image build as an authenticated live
-Steam/FS25 test.
-
-For rollback, record the old image digest and stop the container. Restore a
-matching Wine-prefix, installation/library and configuration backup and select
-the old image/egg. Reverting only the image does not revert Steam game updates.
-Keep Steam and the game stopped while restoring the matching backups.
+GitHub publishes latest and a commit-specific image on main. Test a candidate
+image/server before release. For rollback, stop the container and select the
+previous image/egg with matching prefix, game and configuration backups. Old
+Windows Steam data remains intact, but reverting the image does not undo game
+updates or changes to shared savegames.

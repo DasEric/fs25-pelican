@@ -7,7 +7,7 @@
   "exported_at": "2026-10-07T00:00:00+02:00",
   "name": "Farming Simulator 25",
   "author": "DasEric@users.noreply.github.com",
-  "description": "Farming Simulator 25 dedicated server with GIANTS installer or the normal Windows Steam client. Steam login and Steam Guard are completed in noVNC; the session, game, DLCs and server data persist.",
+  "description": "Farming Simulator 25 dedicated server with GIANTS installer or native Linux Steam and full Proton. Steam login and Steam Guard are completed in noVNC; the session, game, DLCs and server data persist.",
   "features": null,
   "tags": [
     "farming-simulator",
@@ -36,7 +36,7 @@
   "variables": [
     {
       "name": "Installation source",
-      "description": "giants uses an uploaded GIANTS installer; steam opens the normal Windows Steam client. Sign in and complete Steam Guard through noVNC, install FS25/DLCs, run the game once and close it, then restart the container. Keep Steam running and Remember me enabled.",
+      "description": "giants uses an uploaded GIANTS installer; steam opens native Linux Steam. Sign in and complete Steam Guard through noVNC. Select Proton 11 in FS25 Properties > Compatibility, install FS25/DLCs, run the game once and close it, then restart. Keep Steam running and Remember me enabled.",
       "env_variable": "INSTALL_SOURCE",
       "default_value": "giants",
       "user_viewable": true,

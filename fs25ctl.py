@@ -42,9 +42,9 @@ WINE_CONFIG_DIR = (
 PROTON_DIR = pathlib.Path("/opt/fs25/wine")
 STABLE_DIR = pathlib.Path("/opt/wine-stable")
 STEAM_APP_ID = "2300320"
-STEAM_DIR = PREFIX / "drive_c" / "Steam"
-STEAM_LIBRARY_DIR = HOME / "steam" / "library"
-STEAM_SETUP = pathlib.Path("/opt/fs25/SteamSetup.exe")
+STEAM_DIR = HOME / ".local" / "share" / "Steam"
+STEAM_LIBRARY_DIR = STEAM_DIR
+STEAM_LAUNCHER = pathlib.Path("/usr/bin/steam")
 STEAM_SESSION_HELPER = pathlib.Path("/opt/fs25/steam-session.exe")
 
 
@@ -127,26 +127,11 @@ def read_vdf(path: pathlib.Path) -> dict:
     return object_values()
 
 
-def persistent_wine_path(value: str) -> pathlib.Path:
-    """Translate library paths in this prefix; reject ephemeral/external libraries."""
-    if value.startswith("/"):
-        path = pathlib.Path(value)
-    else:
-        windows = pathlib.PureWindowsPath(value)
-        if not windows.is_absolute():
-            raise ValueError("Steam library path must be absolute")
-        drive = windows.drive.lower()
-        if drive == "c:":
-            path = PREFIX / "drive_c"
-        elif drive == "z:":
-            path = pathlib.Path("/")
-        elif re.fullmatch(r"[a-z]:", drive):
-            path = PREFIX / "dosdevices" / drive
-            if not path.is_dir():
-                raise ValueError("Steam library drive is not mapped in this Wine prefix")
-        else:
-            raise ValueError("Steam network libraries are not supported")
-        path = path.joinpath(*windows.parts[1:])
+def persistent_library_path(value: str) -> pathlib.Path:
+    """Resolve native libraries without translating paths through a Wine prefix."""
+    path = pathlib.Path(value)
+    if not path.is_absolute():
+        raise ValueError("Linux Steam library path must be absolute")
     path = path.resolve()
     if not path.is_relative_to(HOME.resolve()):
         raise ValueError("Steam library must be inside /home/container to remain persistent")
@@ -168,7 +153,7 @@ def steam_libraries() -> list[pathlib.Path]:
             if not isinstance(value, str):
                 raise ValueError("Steam library path is missing")
             try:
-                libraries.append(persistent_wine_path(value))
+                libraries.append(persistent_library_path(value))
             except ValueError as exc:
                 # A removed drive or unrelated external library must not hide a
                 # complete FS25 installation in another persistent library.
@@ -176,7 +161,7 @@ def steam_libraries() -> list[pathlib.Path]:
     result = []
     seen = set()
     for library in libraries:
-        # C:\Steam and the default external directory can name the same library.
+        # The client and its default library can name the same directory.
         identity = (library / "steamapps").resolve()
         if identity not in seen:
             result.append(library)
@@ -238,49 +223,126 @@ def game_directory() -> pathlib.Path:
 
 
 def prepare_steam_layout() -> None:
-    STEAM_DIR.parent.mkdir(parents=True, exist_ok=True)
-    if not STEAM_DIR.exists() and not STEAM_DIR.is_symlink():
-        # Link the whole initially empty C:\Steam directory. Pre-creating steamapps
-        # inside it would make the destination non-empty for SteamSetup.
-        link_persistent(STEAM_LIBRARY_DIR, STEAM_DIR)
-    # Existing clients/libraries remain untouched, including earlier prefix installs.
+    # Valve's launcher uses this default path, wholly inside the persistent HOME.
+    # Do not reuse Windows client files or rewrite Steam's own library metadata.
+    STEAM_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def steam_executable() -> pathlib.Path | None:
-    for name in ("steam.exe", "Steam.exe"):
-        path = STEAM_DIR / name
-        if path.is_file():
-            return path
-    return None
+    return STEAM_LAUNCHER if STEAM_LAUNCHER.is_file() else None
 
 
 def steam_command(*, silent: bool = False) -> list[str]:
     executable = steam_executable()
-    if executable:
-        # Xvnc normally has no GPU render node. Limit this to Steam's CEF UI;
-        # do not change graphics or synchronization options for the FS25 game.
-        gui = [] if true_value(env("FS25_STEAM_GPU", "false")) else ["-cef-disable-gpu"]
-        return ["wine", str(executable), *gui, *(["-silent"] if silent else [])]
-    if not STEAM_SETUP.is_file():
-        raise RuntimeError("The bundled Windows Steam installer is missing; pull the updated FS25 image")
-    # NSIS requires /D to be the last argument. Login and Guard stay in Steam's UI.
-    return ["wine", str(STEAM_SETUP), "/S", r"/D=C:\Steam"]
+    if executable is None:
+        raise RuntimeError("The native Linux Steam launcher is missing; pull the updated FS25 image")
+    gui = [] if true_value(env("FS25_STEAM_GPU", "false")) else ["-cef-disable-gpu"]
+    return [str(executable), *gui, *(["-silent"] if silent else [])]
+
+
+def clean_steam_environment() -> dict[str, str]:
+    """Keep the desktop session but isolate Linux Steam/Proton from GIANTS Wine."""
+    result = os.environ.copy()
+    for name in list(result):
+        if name.startswith(("WINE", "PROTON_", "STEAM_COMPAT_", "FS25_SELECTED_WINE", "_FS25_RUNTIME")) or name in {
+            "LD_LIBRARY_PATH", "LD_PRELOAD", "SteamAppId", "SteamGameId", "SteamOverlayGameId",
+        }:
+            result.pop(name, None)
+    bins = {str(PROTON_DIR / "bin"), str(STABLE_DIR / "bin")}
+    result["PATH"] = os.pathsep.join(part for part in result.get("PATH", os.defpath).split(os.pathsep) if part not in bins)
+    result["HOME"] = str(HOME)
+    result["XDG_DATA_HOME"] = str(HOME / ".local/share")
+    return result
 
 
 def steam_launch_context(*, silent: bool = False) -> tuple[list[str], pathlib.Path, dict[str, str]]:
-    """Shared desktop/panel launch settings after prepare/configure_runtime."""
+    """Native client: neither wine nor SteamSetup.exe participates in GUI startup."""
     command = steam_command(silent=silent)
-    client = command[1] != str(STEAM_SETUP)
-    cwd = pathlib.Path(command[1]).parent
-    launch_env = os.environ.copy()
-    launch_env["PROTON_DISABLE_LSTEAMCLIENT"] = "1"
-    if launch_env.get("WINEDEBUG", "-all").strip() in {"", "-all"}:
-        launch_env["WINEDEBUG"] = "-all,err+all"
-    log(f"Starting Steam {'client' if client else 'installer'}: {command[1]}")
-    log(f"Steam working directory: {cwd}; UI: {'background' if silent and client else 'visible'}.")
-    log(f"Steam Wine diagnostics: {launch_env['WINEDEBUG']}; client logs: {STEAM_DIR / 'logs'}.")
+    cwd = HOME
+    launch_env = clean_steam_environment()
+    log(f"Starting native Linux Steam: {command[0]}")
+    log(f"Steam working directory: {cwd}; UI: {'background' if silent else 'visible'}.")
+    log(f"Steam client logs: {STEAM_DIR / 'logs'}.")
     log("An open terminal or updater is not proof that the Steam login/library window is ready.")
     return command, cwd, launch_env
+
+
+def proton_launch_context(directory: pathlib.Path, arguments: list[str], *, verb: str = "run") -> tuple[list[str], dict[str, str]]:
+    """Use the full Proton installation last used by Steam for this exact game."""
+    compatdata = directory.parent.parent / "compatdata" / STEAM_APP_ID
+    info = compatdata / "config_info"
+    try:
+        if info.stat().st_size > 64 * 1024:
+            raise ValueError("Proton prefix metadata is too large")
+        lines = info.read_text(encoding="utf-8").splitlines()
+        # Valve Proton records: prefix version, fonts directory, lib directory,
+        # Steam directory. Use that record instead of guessing an installed tool.
+        libs = pathlib.Path(lines[2])
+        if not libs.is_absolute() or libs.name != "lib" or libs.parent.name != "files":
+            raise ValueError("Unexpected Proton library path")
+        tool = libs.parent.parent.resolve()
+        if not tool.is_relative_to(HOME.resolve()):
+            raise ValueError("Proton must be installed in the persistent Steam library")
+        for path in (tool / "proton", tool / "files/bin/wine", tool / "files/bin/wineserver", compatdata / "pfx/system.reg"):
+            if not path.is_file() or path.stat().st_size == 0:
+                raise ValueError(f"Proton first-run files are missing: {path.name}")
+        bridge = libs / "wine" / "x86_64-unix" / "lsteamclient.so"
+        if not bridge.is_file():
+            raise ValueError("Full Proton's Linux Steam bridge is missing")
+    except (OSError, ValueError, IndexError) as exc:
+        raise SteamNotReady(
+            f"Proton setup is pending ({exc}). In Linux Steam, select Proton 11 in FS25 Properties > Compatibility, "
+            "start FS25 once, then close the game before starting the web server."
+        ) from exc
+    compatdata = compatdata.resolve()
+    if not compatdata.is_relative_to(HOME.resolve()) or not (compatdata / "pfx").resolve().is_relative_to(HOME.resolve()):
+        raise SteamNotReady("FS25's Proton prefix must remain inside the persistent Steam library")
+    process_env = clean_steam_environment()
+    process_env.update({
+        "STEAM_COMPAT_CLIENT_INSTALL_PATH": str(STEAM_DIR.resolve()),
+        "STEAM_COMPAT_DATA_PATH": str(compatdata),
+        "STEAM_COMPAT_INSTALL_PATH": str(directory),
+        "STEAM_COMPAT_LIBRARY_PATHS": str(directory.parent.parent.parent),
+        "SteamAppId": STEAM_APP_ID, "SteamGameId": STEAM_APP_ID,
+        "PROTON_DISABLE_LSTEAMCLIENT": "0",
+        "PROTON_LOG_DIR": str(LOG_DIR),
+        # The server is already inside the Pelican container. Execute Proton's
+        # own launcher; never mix its Wine DLLs with /opt/fs25/wine or WineHQ.
+        "LD_LIBRARY_PATH": "/opt/fs25/wine-compat",
+    })
+    for name in ("PROTON_LOG", "PROTON_USE_WINED3D", "PROTON_NO_FSYNC", "PROTON_NO_NTSYNC"):
+        if name in os.environ:
+            process_env[name] = os.environ[name]
+    trace = env("WINEDEBUG", "-all")
+    process_env["WINEDEBUG"] = "-all,err+all" if trace in {"", "-all"} else trace
+    return [sys.executable, str(tool / "proton"), verb, *arguments], process_env
+
+
+def prepare_proton_config(process_env: dict[str, str]) -> None:
+    target = pathlib.Path(process_env["STEAM_COMPAT_DATA_PATH"]) / "pfx/drive_c/users/steamuser/Documents/My Games/FarmingSimulator2025"
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink() and target.resolve() == CONFIG_DIR.resolve():
+        return
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        raise SteamNotReady(f"Unexpected FS25 Documents link: {target}; retain it and check its destination")
+    if target.exists():
+        # First normal game launch may have created defaults. Preserve them in
+        # the prefix; never replace existing server settings/savegames with them.
+        backup = target.with_name(target.name + ".before-fs25-link")
+        count = 1
+        while backup.exists():
+            backup = target.with_name(target.name + f".before-fs25-link-{count}")
+            count += 1
+        target.rename(backup)
+        for source in backup.rglob("*"):
+            destination = CONFIG_DIR / source.relative_to(backup)
+            if source.is_dir():
+                destination.mkdir(parents=True, exist_ok=True)
+            elif source.is_file() and not destination.exists():
+                shutil.copy2(source, destination)
+        log(f"First-run FS25 settings retained at {backup}; existing server data takes priority.")
+    target.symlink_to(CONFIG_DIR, target_is_directory=True)
 
 
 def open_steam() -> None:
@@ -319,14 +381,18 @@ def ensure_steam_appid(directory: pathlib.Path) -> None:
 
 def steam_session_ready(directory: pathlib.Path, *, timeout: float = 25) -> bool:
     """Ask the installed game's Steam API; saved login files are not session proof."""
-    if steam_executable() is None:
+    deadline = time.monotonic() + timeout
+    if not any((STEAM_DIR / name).is_file() for name in ("linux64/steamclient.so", "linux32/steamclient.so")):
         return False
     if not STEAM_SESSION_HELPER.is_file():
         raise RuntimeError("Steam session checker is missing; pull the updated FS25 image")
     api = next((directory / name for name in ("x64/steam_api64.dll", "steam_api64.dll") if (directory / name).is_file()), None)
     if api is None:
         raise SteamNotReady("FS25's Steam API is missing; verify the game files in Steam")
-    deadline = time.monotonic() + timeout
+    path_command, probe_env = proton_launch_context(directory, [str(api)], verb="getcompatpath")
+    # Proton logging redirects the helper's stdout to a file. Readiness needs
+    # its literal stdout marker; keep PROTON_LOG only for the real server.
+    probe_env.pop("PROTON_LOG", None)
 
     def remaining(limit: float) -> float:
         budget = min(limit, deadline - time.monotonic())
@@ -335,13 +401,12 @@ def steam_session_ready(directory: pathlib.Path, *, timeout: float = 25) -> bool
         return budget
 
     try:
-        windows_path = subprocess.run(["winepath", "-w", str(api)], capture_output=True, text=True, timeout=remaining(10), check=True).stdout.strip()
+        windows_path = subprocess.run(path_command, cwd=directory, env=probe_env, capture_output=True, text=True, timeout=remaining(10), check=True).stdout.strip()
         if not windows_path:
             raise RuntimeError("Wine returned an empty Steam API path")
-        probe_env = os.environ.copy()
-        probe_env.update({"SteamAppId": STEAM_APP_ID, "SteamGameId": STEAM_APP_ID})
+        probe_command = [*path_command[:2], "run", str(STEAM_SESSION_HELPER), windows_path]
         result = subprocess.run(
-            ["wine", str(STEAM_SESSION_HELPER), windows_path], cwd=directory,
+            probe_command, cwd=directory,
             capture_output=True, text=True, timeout=remaining(15), env=probe_env,
         )
     except subprocess.TimeoutExpired:
@@ -350,7 +415,7 @@ def steam_session_ready(directory: pathlib.Path, *, timeout: float = 25) -> bool
         return True
     if result.returncode == 1:
         return False
-    raise RuntimeError("Steam API session check failed; verify FS25's Steam files and the Wine runtime")
+    raise RuntimeError(f"Steam API session check failed (exit {result.returncode}; {result.stdout.strip()}; {result.stderr.strip()}); check FS25/Proton files and logs")
 
 
 def shutdown_steam() -> None:
@@ -358,7 +423,7 @@ def shutdown_steam() -> None:
     if executable is None:
         return
     try:
-        subprocess.run(["wine", str(executable), "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        subprocess.run([str(executable), "-shutdown"], cwd=HOME, env=clean_steam_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         log("Steam shutdown did not finish within 10 seconds; container cleanup continues.")
 
@@ -558,9 +623,8 @@ print("futex_waitv and shared memory are available", flush=True)
 
 def select_wine_runtime() -> None:
     """Select once in the parent; desktop and GIANTS children inherit the result."""
-    # This image runs Windows Steam, never Linux Steam. Proton otherwise hooks
-    # steamclient DLLs and redirects their tier0/vstdlib imports to ntdll.
-    # Enforce this even for desktop children inheriting a selected runtime.
+    # Standalone Wine is for GIANTS only. Steam's full Proton launch uses a
+    # separate clean environment and explicitly enables the Linux Steam bridge.
     os.environ["PROTON_DISABLE_LSTEAMCLIENT"] = "1"
     if env("_FS25_RUNTIME_READY") == "1":
         return
@@ -631,7 +695,8 @@ def observed_wine_sync(pid: str, proc: pathlib.Path = pathlib.Path("/proc")) -> 
 
 def configure_runtime() -> None:
     """Set inherited Wine options and use the permitted open-file allowance."""
-    select_wine_runtime()
+    if installation_source() == "giants":
+        select_wine_runtime()
     if env("WINE_AUDIO_MODE", "disabled").lower() == "disabled":
         overrides = [part.strip() for part in env("WINEDLLOVERRIDES", "mscoree=d").split(";") if part.strip()]
         for library in ("winealsa.drv", "winepulse.drv", "winedbg.exe"):
@@ -930,18 +995,18 @@ def create_desktop_shortcuts() -> None:
 
 def prepare() -> None:
     configure_runtime()
+    if installation_source() == "steam":
+        prepare_steam_layout()
+        create_desktop_shortcuts()
+        # GUI startup must not wait for Wine or create/repair a GIANTS prefix.
+        # Steam creates FS25's own compatdata prefix on the first game launch.
+        return
     ensure_prefix()
     configure_headless_wine()
-    source = installation_source()
-    if source == "giants":
-        link_persistent(GAME_DIR, WINE_GAME_DIR)
-    else:
-        prepare_steam_layout()
+    link_persistent(GAME_DIR, WINE_GAME_DIR)
     link_persistent(CONFIG_DIR, WINE_CONFIG_DIR)
     create_desktop_shortcuts()
-    # Steam owns its library. Do not generate XML/game folders before download.
-    if source == "giants":
-        configure()
+    configure()
 
 
 def archive_command(archive: pathlib.Path, output: pathlib.Path) -> list[str]:
@@ -1244,6 +1309,11 @@ def start_webserver() -> int:
             ensure_steam_appid(directory)
             if not steam_session_ready(directory):
                 raise SteamNotReady("Sign in to Steam in noVNC and keep the client running, then start the FS25 web server again")
+            # Readiness probing must not relink Documents while a user starts
+            # the normal game. Link data only during the locked server start.
+            require_server_stopped()
+            _, process_env = proton_launch_context(directory, [str(executable)])
+            prepare_proton_config(process_env)
         configure()
         patch_web()
         # Steam can change its manifest during a login/update. Revalidate right
@@ -1253,7 +1323,13 @@ def start_webserver() -> int:
         require_server_stopped()
         # The controller retains the lock; an exec'ed Wine loader may close
         # inherited descriptors and accidentally release it before the game exits.
-        result = subprocess.run(["wine", str(executable)], cwd=directory)
+        if installation_source() == "steam":
+            command, process_env = proton_launch_context(directory, [str(executable)])
+            prepare_proton_config(process_env)
+            log(f"Starting FS25 dedicated server with full Proton: {command[1]}")
+            result = subprocess.run(command, cwd=directory, env=process_env)
+        else:
+            result = subprocess.run(["wine", str(executable)], cwd=directory)
         return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 

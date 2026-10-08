@@ -85,16 +85,45 @@ ADD         --checksum=sha256:c450f920ef7380f12dca742d8c96bcc672aec36b24b2f10d4d
             https://codeload.github.com/Kron4ek/Wine-Builds/tar.gz/fe137c65b411ff3079d1b26573dcb70bf16814a5 \
             /opt/fs25/wine-source/prebuilt-build-recipe.tar.gz
 
-# Official Windows client bootstrap. Steam credentials and games are never baked in.
-ADD         --checksum=sha256:7d3654531c32d941b8cae81c4137fc542172bfa9635f169cb392f245a0a12bcb \
-            https://cdn.fastly.steamstatic.com/client/installer/SteamSetup.exe \
-            /opt/fs25/SteamSetup.exe
+# Official native Linux launcher, pinned to an immutable versioned download.
+# Client updates, full Proton, game files and account data belong to persistent HOME.
+ADD         --checksum=sha256:765aba9a0ed339a50226ceb614fcc9879a991ba184098bc8de920efb12c714a4 \
+            https://repo.steampowered.com/steam/archive/stable/steam-launcher_1.0.0.87_amd64.deb \
+            /tmp/steam-launcher.deb
+ADD         --checksum=sha256:89a19f70808757c236376ec4bac7748b90a11efbe26def951c81d2b37079c56d \
+            https://repo.steampowered.com/steam/archive/stable/steam-libs-amd64_1.0.0.87_amd64.deb \
+            /tmp/steam-libs-amd64.deb
+ADD         --checksum=sha256:05cf84ce342c32a8bcc2fc6c146fa803ecfb339ebe0997584b324700e4a9514a \
+            https://repo.steampowered.com/steam/archive/stable/steam-libs-i386_1.0.0.87_i386.deb \
+            /tmp/steam-libs-i386.deb
 COPY        --from=steam-session /steam-session.exe /opt/fs25/steam-session.exe
 COPY        --from=steam-session /usr/share/doc /opt/fs25/steam-probe-licenses
 COPY        --from=steam-session --chown=container /steam-api-test.dll /steam-api-unsupported-test.dll /tmp/
 COPY        --from=steam-session --chown=container /steam-import-64 /tmp/steam-import-64/
 COPY        --from=steam-session --chown=container /steam-import-32 /tmp/steam-import-32/
-RUN         chmod 0444 /opt/fs25/SteamSetup.exe /opt/fs25/steam-session.exe
+RUN         chmod 0444 /opt/fs25/steam-session.exe
+
+# Install Valve's actual dependency metapackages as well: steamdeps checks their
+# presence, not just installed shared libraries. No runtime sudo/package prompts.
+# Remove the launcher's apt sources before clearing indexes: the fixed image
+# already has its dependencies, and steamdeps must not prompt for apt update.
+RUN         dpkg --add-architecture i386 \
+            && apt-get update \
+            && apt-get install -y --no-install-recommends \
+                /tmp/steam-launcher.deb /tmp/steam-libs-amd64.deb /tmp/steam-libs-i386.deb \
+                libc6:i386 libcrypt1:i386 libgcc-s1:i386 libstdc++6:i386 \
+                libegl1:i386 libgbm1:i386 libgl1:i386 libgl1-mesa-dri:i386 \
+                libgpg-error0:i386 libudev1:i386 libxcb-dri3-0:i386 \
+                libxcb1:i386 libxinerama1:i386 libx11-6:i386 \
+                libgl1 libegl1 libgbm1 libxcb-dri3-0 libxinerama1 \
+                libnss3 libxss1 libxtst6 libvulkan1 libvulkan1:i386 \
+                mesa-vulkan-drivers mesa-vulkan-drivers:i386 \
+                bubblewrap xdg-utils xdg-desktop-portal xdg-desktop-portal-gtk \
+            && test -x /usr/bin/steam \
+            && dpkg-query -W steam-launcher steam-libs-amd64 steam-libs-i386 \
+            && rm -f /etc/apt/sources.list.d/steam-stable.list /etc/apt/sources.list.d/steam-beta.list \
+            && rm /tmp/steam-launcher.deb /tmp/steam-libs-amd64.deb /tmp/steam-libs-i386.deb \
+            && rm -rf /var/lib/apt/lists/*
 
 # Let Debian select its FFmpeg library ABI instead of pinning release-specific package names.
 RUN         apt update \
