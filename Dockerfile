@@ -10,7 +10,7 @@ COPY        tests/steam_import_fixture.c /src/steam_import_fixture.c
 COPY        tests/steam_gui_probe.c /src/steam_gui_probe.c
 RUN         x86_64-w64-mingw32-gcc -std=c11 -Os -s -municode \
                 -Wall -Wextra -Werror -Wno-cast-function-type \
-                /src/steam_session.c -o /steam-session.exe \
+                /src/steam_session.c -lshell32 -o /steam-session.exe \
             && x86_64-w64-mingw32-gcc -std=c11 -Os -s -shared -Wall -Wextra -Werror \
                 /src/steam_api_stub.c -o /steam-api-test.dll \
             && x86_64-w64-mingw32-gcc -std=c11 -Os -s -shared -Wall -Wextra -Werror \
@@ -285,6 +285,7 @@ RUN         mkdir -m 0700 /tmp/fs25-steam-wine-smoke \
                 && wine /tmp/steam-import-32/steam-import-test.exe "Z:\tmp\steam-import-32\steamclient.dll" \
                 && wine /tmp/steam-import-64/steam-gui-test.exe \
                 && wine /tmp/steam-import-32/steam-gui-test.exe \
+                && wine /opt/fs25/steam-session.exe --documents | grep -E "^FS25_DOCUMENTS=[A-Za-z]:" \
                 && FS25_STEAM_STUB_MODE=ready wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-test.dll" \
                 && wineserver -w' \
             && rm -rf /tmp/fs25-steam-wine-smoke
@@ -302,6 +303,7 @@ RUN         mkdir -m 0700 /tmp/fs25-wine-smoke \
                 && wine /tmp/steam-import-32/steam-import-test.exe "Z:\tmp\steam-import-32\steamclient.dll" \
                 && wine /tmp/steam-import-64/steam-gui-test.exe \
                 && wine /tmp/steam-import-32/steam-gui-test.exe \
+                && wine /opt/fs25/steam-session.exe --documents | grep -E "^FS25_DOCUMENTS=[A-Za-z]:" \
                 && FS25_STEAM_STUB_MODE=ready wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-test.dll" \
                 && { status=0; FS25_STEAM_STUB_MODE=offline wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-test.dll" || status=$?; test "$status" -eq 1; } \
                 && { status=0; wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-unsupported-test.dll" || status=$?; test "$status" -eq 2; } \

@@ -10,6 +10,41 @@ not start successfully. Do not label a successful download or web page as a
 working licensed game server. The normal Windows client also had an unresolved
 login e20 in that test. This change does not claim that problem is fixed.
 
+## Persistent profile binding
+
+The controller queries `SHGetFolderPathW(CSIDL_PERSONAL, SHGFP_TYPE_CURRENT)`
+through the existing native helper's `--documents` mode under the selected
+Wine/Proton runtime. It never infers the Windows user from Linux `USER`.
+Redirected Documents and native Proton's actual prefix are respected; failed,
+ambiguous or non-persistent paths stop configuration instead of creating a
+second, guessed profile. The Docker smoke tests exercise the helper in both
+bundled Wine runtimes.
+
+`Documents/My Games/FarmingSimulator2025` links to the persistent profile,
+normally `/home/container/config/FarmingSimulator2025`. Windows Steam binds it
+before client/game first run, without waiting for a Steam API login. Native
+Steam waits for its real Proton first-run metadata; both backends also check
+the binding at dedicated-server startup. A running game/web service prevents
+early Steam configuration changes.
+
+Persistent files win over old prefix files. The previous directory is retained
+as `.before-fs25-link[-N]`; only missing files are imported. An existing
+`savegameN` is never combined with files from a different farm. Copy/link failures
+retain or restore the original Wine directory. Non-empty Egg fields override
+their corresponding XML values; empty fields retain existing settings. XML
+parse/root errors stop the operation and do not silently regenerate defaults.
+
+A profile-root `dedicatedServerConfig.xml` is copied into `dedicated_server`
+only when that destination is absent. Originals
+remain untouched. Active `gameSettings.xml` mod-directory overrides are disabled
+(with an XML backup) so uploaded PC drive letters do not hide the profile's mods.
+
+Live acceptance after deploying the image: verify the logged persistent and
+Windows profile paths, Egg override labels (never password values), and selected
+slot. Confirm in GIANTS that the intended savegame and mods appear, then start
+and save the farm, restart the container and verify persistence. Local tests do
+not substitute for this licensed-game/node check.
+
 ## Service ownership
 
 - `entrypoint.py` supervises Xvnc for the container lifetime. Web-service exit,

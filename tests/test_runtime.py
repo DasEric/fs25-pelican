@@ -47,7 +47,6 @@ class RuntimeFixture(unittest.TestCase):
             "SERVER_EXE": self.game / "dedicatedServer.exe",
             "GAME_EXE": self.game / "FarmingSimulator2025.exe",
             "WINE_GAME_DIR": self.prefix / "drive_c" / "Program Files (x86)" / "Farming Simulator 2025",
-            "WINE_CONFIG_DIR": self.prefix / "drive_c" / "users" / "container" / "Documents" / "My Games" / "FarmingSimulator2025",
         }
         for name, value in {
             "STEAM_DIR": self.steam,
@@ -124,6 +123,278 @@ class RuntimeFixture(unittest.TestCase):
         (data / "pfx/system.reg").write_bytes(b"prefix fixture")
         (data / "config_info").write_text(f"11.1000\n{tool / 'files/share/fonts'}\n{tool / 'files/lib'}\n{self.steam}\n", encoding="utf-8")
         return tool, data
+
+
+class ProfileBindingTests(RuntimeFixture):
+    def old_profile(self):
+        target = self.prefix / "drive_c/users/actual-user/Documents/My Games/FarmingSimulator2025"
+        target.mkdir(parents=True)
+        self.config.mkdir(parents=True)
+        return target
+
+    def query(self, output, status=0, environment=None):
+        with mock.patch.object(ctl.subprocess, "run", return_value=subprocess.CompletedProcess([], status, output, "")) as execute:
+            result = ctl.runtime_documents(["wine", "helper.exe", "--documents"], environment or {}, self.prefix)
+        return result, execute
+
+    def test_real_documents_username_replaces_environment_guess(self):
+        result, execute = self.query("FS25_DOCUMENTS=C:\\users\\steamuser\\Documents\n")
+        self.assertEqual(result, (self.prefix / "drive_c/users/steamuser/Documents").resolve())
+        self.assertNotIn("container", str(result.relative_to(self.prefix)))
+        self.assertEqual(execute.call_args.args[0][-1], "--documents")
+
+    def test_redirected_documents_and_unicode_are_used(self):
+        # Z: maps the host root on both the Linux image and this Windows fixture.
+        windows = "Z:" + self.home.as_posix().split(":", 1)[-1] + "/Dokumente Ä"
+        result, _ = self.query("Wine notice\nFS25_DOCUMENTS=" + windows + "\n")
+        self.assertEqual(result, (self.home / "Dokumente Ä").resolve())
+
+    def test_documents_probe_does_not_change_runtime_or_redirect_stdout_to_proton_log(self):
+        environment = {"WINEPREFIX": str(self.prefix), "PROTON_LOG": "1", "PROTON_DISABLE_LSTEAMCLIENT": "0"}
+        _, execute = self.query("FS25_DOCUMENTS=C:\\users\\actual\\Documents\n", environment=environment)
+        probe_env = execute.call_args.kwargs["env"]
+        self.assertNotIn("PROTON_LOG", probe_env)
+        self.assertEqual(probe_env["WINEPREFIX"], str(self.prefix))
+        self.assertEqual(probe_env["PROTON_DISABLE_LSTEAMCLIENT"], "0")
+        self.assertIn("PROTON_LOG", environment)
+
+    def test_failed_or_ambiguous_documents_lookup_never_guesses(self):
+        for output, status in (("", 0), ("FS25_DOCUMENTS_LOOKUP_FAILED\n", 2),
+                               ("FS25_DOCUMENTS=C:\\Docs\nFS25_DOCUMENTS=C:\\Other\n", 0),
+                               ("FS25_DOCUMENTS=C:\\Docs\n", 1)):
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                self.query(output, status)
+
+    def test_unsafe_documents_paths_are_rejected(self):
+        for value in (r"\\host\share", r"C:\..\outside", "relative", r"Z:\outside", r"Q:\unmapped"):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                self.query("FS25_DOCUMENTS=" + value + "\n")
+
+    def test_probe_timeout_retains_profile(self):
+        self.config.mkdir(parents=True)
+        saved = self.config / "game.xml"
+        saved.write_bytes(b"keep")
+        with mock.patch.object(ctl.subprocess, "run", side_effect=subprocess.TimeoutExpired("wine", 60)), \
+                mock.patch.object(ctl, "link_persistent") as link:
+            with self.assertRaises(RuntimeError):
+                ctl.bind_profile(["wine", "helper", "--documents"], {}, self.prefix)
+        link.assert_not_called()
+        self.assertEqual(saved.read_bytes(), b"keep")
+
+    def test_existing_config_is_authoritative_and_original_is_backed_up(self):
+        target = self.old_profile()
+        (self.config / "game.xml").write_bytes(b"uploaded settings")
+        (target / "game.xml").write_bytes(b"old Wine defaults")
+        with mock.patch.object(pathlib.Path, "symlink_to") as link:
+            ctl.link_persistent(self.config, target)
+        self.assertEqual((self.config / "game.xml").read_bytes(), b"uploaded settings")
+        self.assertEqual((target.with_name(target.name + ".before-fs25-link") / "game.xml").read_bytes(), b"old Wine defaults")
+        link.assert_called_once_with(self.config.resolve(), target_is_directory=True)
+
+    def test_existing_savegame_is_not_combined_with_another_farm(self):
+        target = self.old_profile()
+        (target / "savegame1").mkdir()
+        (target / "savegame1/vehicles.xml").write_bytes(b"wrong farm vehicles")
+        (self.config / "savegame1").mkdir()
+        (self.config / "savegame1/careerSavegame.xml").write_bytes(b"uploaded farm")
+        with mock.patch.object(pathlib.Path, "symlink_to"):
+            ctl.link_persistent(self.config, target)
+        self.assertFalse((self.config / "savegame1/vehicles.xml").exists())
+        self.assertEqual((self.config / "savegame1/careerSavegame.xml").read_bytes(), b"uploaded farm")
+
+    def test_missing_savegame_is_seeded_as_a_whole(self):
+        target = self.old_profile()
+        (target / "savegame3").mkdir()
+        for filename in ("careerSavegame.xml", "vehicles.xml", "farms.xml"):
+            (target / "savegame3" / filename).write_bytes(filename.encode())
+        with mock.patch.object(pathlib.Path, "symlink_to"):
+            ctl.link_persistent(self.config, target)
+        for filename in ("careerSavegame.xml", "vehicles.xml", "farms.xml"):
+            self.assertEqual((self.config / "savegame3" / filename).read_bytes(), filename.encode())
+
+    def test_mods_are_retained_and_only_missing_files_are_seeded(self):
+        target = self.old_profile()
+        (target / "mods").mkdir()
+        (self.config / "mods").mkdir()
+        (target / "mods/map.zip").write_bytes(b"old version")
+        (target / "mods/tractor.zip").write_bytes(b"additional mod")
+        (self.config / "mods/map.zip").write_bytes(b"uploaded mod")
+        with mock.patch.object(pathlib.Path, "symlink_to"):
+            ctl.link_persistent(self.config, target)
+        self.assertEqual((self.config / "mods/map.zip").read_bytes(), b"uploaded mod")
+        self.assertEqual((self.config / "mods/tractor.zip").read_bytes(), b"additional mod")
+
+    def test_failed_link_restores_original_wine_directory(self):
+        target = self.old_profile()
+        (target / "game.xml").write_bytes(b"original")
+        with mock.patch.object(pathlib.Path, "symlink_to", side_effect=OSError("fixture failure")), self.assertRaises(OSError):
+            ctl.link_persistent(self.config, target)
+        self.assertEqual((target / "game.xml").read_bytes(), b"original")
+
+    def test_real_profile_link_reads_mods_and_savegame_and_persists_writes(self):
+        target = self.old_profile()
+        (target / "game.xml").write_bytes(b"old defaults")
+        (self.config / "mods").mkdir()
+        (self.config / "mods/tractor.zip").write_bytes(b"uploaded mod")
+        (self.config / "savegame1").mkdir()
+        (self.config / "savegame1/careerSavegame.xml").write_bytes(b"uploaded farm")
+        try:
+            ctl.link_persistent(self.config, target)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                self.skipTest("Windows symlink privilege required; exercised on Linux CI")
+            raise
+        self.assertTrue(target.is_symlink())
+        self.assertEqual((target / "mods/tractor.zip").read_bytes(), b"uploaded mod")
+        self.assertEqual((target / "savegame1/careerSavegame.xml").read_bytes(), b"uploaded farm")
+        (target / "savegame1/vehicles.xml").write_bytes(b"saved through Wine profile")
+        self.assertEqual((self.config / "savegame1/vehicles.xml").read_bytes(), b"saved through Wine profile")
+        ctl.link_persistent(self.config, target)
+        self.assertFalse(target.with_name(target.name + ".before-fs25-link-1").exists())
+
+    def test_failed_copy_keeps_original_wine_directory(self):
+        target = self.old_profile()
+        (target / "game.xml").write_bytes(b"original")
+        with mock.patch.object(ctl.shutil, "copy2", side_effect=OSError("full disk")), \
+                mock.patch.object(pathlib.Path, "symlink_to") as link, self.assertRaises(OSError):
+            ctl.link_persistent(self.config, target)
+        self.assertEqual((target / "game.xml").read_bytes(), b"original")
+        link.assert_not_called()
+
+    def test_previous_backup_is_not_replaced(self):
+        target = self.old_profile()
+        backup = target.with_name(target.name + ".before-fs25-link")
+        backup.mkdir()
+        (backup / "game.xml").write_bytes(b"old backup")
+        with mock.patch.object(pathlib.Path, "symlink_to"):
+            ctl.link_persistent(self.config, target)
+        self.assertEqual((backup / "game.xml").read_bytes(), b"old backup")
+        self.assertTrue(target.with_name(target.name + ".before-fs25-link-1").is_dir())
+
+    def test_overlapping_profile_paths_fail_before_moving_data(self):
+        self.config.mkdir(parents=True)
+        for source, target in ((self.config, self.config / "nested"), (self.config / "nested", self.config)):
+            with self.subTest(source=source), self.assertRaises(RuntimeError):
+                ctl.link_persistent(source, target)
+        self.assertTrue(self.config.is_dir())
+
+    def test_invalid_xml_is_not_silently_replaced_with_defaults(self):
+        for contents in (b"<broken", b"<wrongRoot/>"):
+            with self.subTest(contents=contents):
+                self.config.mkdir(parents=True, exist_ok=True)
+                path = self.config / "gameSettings.xml"
+                path.write_bytes(contents)
+                with self.assertRaises(RuntimeError):
+                    ctl.configure()
+                self.assertEqual(path.read_bytes(), contents)
+
+    def test_uploaded_mods_override_uses_profile_mods_and_keeps_other_settings(self):
+        self.config.mkdir(parents=True)
+        path = self.config / "gameSettings.xml"
+        original = b'<gameSettings revision="42"><modsDirectoryOverride active="true" directory="D:/oldPC/mods"/><other value="keep"/></gameSettings>'
+        path.write_bytes(original)
+        ctl.configure_profile_mods()
+        root = ET.parse(path).getroot()
+        self.assertEqual(root.find("modsDirectoryOverride").get("active"), "false")
+        self.assertEqual(root.find("other").get("value"), "keep")
+        self.assertEqual(root.get("revision"), "42")
+        self.assertEqual(path.with_suffix(".xml.bak").read_bytes(), original)
+        ctl.configure_profile_mods()
+        self.assertEqual(path.with_suffix(".xml.bak").read_bytes(), original)
+
+    def test_uploaded_root_server_config_is_imported_not_recreated(self):
+        self.config.mkdir(parents=True)
+        path = self.config / "dedicatedServerConfig.xml"
+        original = b'<gameserver><settings><game_name>Uploaded farm</game_name><savegame_index>4</savegame_index><mapID>MyMap</mapID></settings><mods><mod>map.zip</mod></mods></gameserver>'
+        path.write_bytes(original)
+        ctl.configure()
+        result = ET.parse(ctl.DEDICATED_DIR / path.name).getroot()
+        self.assertEqual(result.findtext("settings/game_name"), "Uploaded farm")
+        self.assertEqual(result.findtext("settings/savegame_index"), "4")
+        self.assertEqual(result.findtext("mods/mod"), "map.zip")
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_giants_prepare_binds_actual_documents_before_applying_egg(self):
+        events = []
+        with mock.patch.multiple(ctl, configure_runtime=mock.DEFAULT, ensure_prefix=mock.DEFAULT,
+                                 configure_headless_wine=mock.DEFAULT, create_desktop_shortcuts=mock.DEFAULT,
+                                 link_persistent=mock.DEFAULT), \
+                mock.patch.object(ctl, "bind_profile", side_effect=lambda *args: events.append(("bind", args))), \
+                mock.patch.object(ctl, "configure", side_effect=lambda: events.append(("configure",))):
+            ctl.prepare()
+        self.assertEqual([event[0] for event in events], ["bind", "configure"])
+        self.assertEqual(events[0][1][0], ["wine", str(ctl.STEAM_SESSION_HELPER), "--documents"])
+        self.assertEqual(events[0][1][2], self.prefix)
+
+    def test_native_steam_profile_is_bound_before_config_and_without_api_login(self):
+        os.environ["INSTALL_SOURCE"] = "steam"
+        directory = self.steam_install()
+        self.proton_fixture(directory)
+        events = []
+        with mock.patch.object(ctl, "require_server_stopped"), \
+                mock.patch.object(ctl, "prepare_proton_config", side_effect=lambda env: events.append("bind")), \
+                mock.patch.object(ctl, "configure", side_effect=lambda: events.append("configure")), \
+                mock.patch.object(ctl, "steam_session_ready") as api:
+            ctl.prepare_steam_profile()
+        self.assertEqual(events, ["bind", "configure"])
+        api.assert_not_called()
+
+    def test_windows_steam_binds_before_game_installation_or_api_login(self):
+        os.environ.update({"INSTALL_SOURCE": "steam", "FS25_STEAM_BACKEND": "windows"})
+        prefix = self.home / ".fs25steam"
+        with mock.patch.object(ctl, "STEAM_WINDOWS_PREFIX", prefix), \
+                mock.patch.object(ctl, "require_server_stopped"), \
+                mock.patch.object(ctl, "prepare_proton_config") as bind, \
+                mock.patch.object(ctl, "configure") as configure, \
+                mock.patch.object(ctl, "steam_session_ready") as api:
+            ctl.prepare_steam_profile()
+        self.assertEqual(bind.call_args.args[0]["WINEPREFIX"], str(prefix))
+        configure.assert_not_called()  # No game files to configure yet.
+        api.assert_not_called()
+
+    def test_binding_then_egg_overrides_preserves_uploaded_mods_and_savegame(self):
+        self.config.mkdir(parents=True)
+        (self.config / "mods").mkdir()
+        (self.config / "mods/tractor.zip").write_bytes(b"uploaded mod")
+        (self.config / "savegame4").mkdir()
+        (self.config / "savegame4/careerSavegame.xml").write_bytes(b"uploaded farm")
+        ctl.DEDICATED_DIR.mkdir()
+        path = ctl.DEDICATED_DIR / "dedicatedServerConfig.xml"
+        path.write_bytes(b'<gameserver><settings><game_name>Previous</game_name><savegame_index>4</savegame_index><mapID>MyMap</mapID></settings><mods><mod>tractor.zip</mod></mods></gameserver>')
+        documents = self.prefix / "drive_c/users/actual-user/Documents"
+        with mock.patch.object(ctl, "runtime_documents", return_value=documents), \
+                mock.patch.object(pathlib.Path, "symlink_to") as link, \
+                mock.patch.dict(os.environ, {"SERVER_NAME": "Egg farm", "SERVER_PASSWORD": "fixture-game", "SERVER_ADMIN": "fixture-admin", "WEB_USERNAME": "egg-user", "WEB_PASSWORD": "fixture-web"}):
+            ctl.bind_profile(["wine", "helper", "--documents"], {}, self.prefix)
+            ctl.configure()
+        link.assert_called_once_with(self.config.resolve(), target_is_directory=True)
+        settings = ET.parse(path).getroot()
+        self.assertEqual(settings.findtext("settings/game_name"), "Egg farm")
+        self.assertEqual(settings.findtext("settings/game_password"), "fixture-game")
+        self.assertEqual(settings.findtext("settings/admin_password"), "fixture-admin")
+        self.assertEqual(settings.findtext("settings/savegame_index"), "4")
+        self.assertEqual(settings.findtext("settings/mapID"), "MyMap")
+        self.assertEqual(settings.findtext("mods/mod"), "tractor.zip")
+        server = ET.parse(self.game / "dedicatedServer.xml").getroot()
+        self.assertEqual(server.findtext("webserver/initial_admin/username"), "egg-user")
+        self.assertEqual(server.findtext("webserver/initial_admin/passphrase"), "fixture-web")
+        self.assertEqual((self.config / "mods/tractor.zip").read_bytes(), b"uploaded mod")
+        self.assertEqual((self.config / "savegame4/careerSavegame.xml").read_bytes(), b"uploaded farm")
+
+    def test_image_links_shell_library_and_checks_both_documents_lookups(self):
+        source = (SOURCE / "Dockerfile").read_text()
+        self.assertIn("steam_session.c -lshell32", source)
+        self.assertEqual(source.count('wine /opt/fs25/steam-session.exe --documents | grep -E "^FS25_DOCUMENTS=[A-Za-z]:"'), 2)
+
+    def test_active_game_is_not_reconfigured_when_opening_steam(self):
+        os.environ["INSTALL_SOURCE"] = "steam"
+        directory = self.steam_install()
+        self.proton_fixture(directory)
+        with mock.patch.object(ctl, "require_server_stopped", side_effect=ctl.ServerAlreadyRunning("running")), \
+                mock.patch.object(ctl, "prepare_proton_config") as bind, mock.patch.object(ctl, "configure") as configure:
+            ctl.prepare_steam_profile()
+        bind.assert_not_called()
+        configure.assert_not_called()
 
 
 class ExistingBehaviourTests(RuntimeFixture):
@@ -873,6 +1144,7 @@ class StandaloneWineRuntimeTests(RuntimeFixture):
 
         with mock.patch.object(ctl, "ensure_prefix", side_effect=check_environment), \
                 mock.patch.object(ctl, "configure_headless_wine"), \
+                mock.patch.object(ctl, "bind_profile"), \
                 mock.patch.object(ctl, "link_persistent"), \
                 mock.patch.object(ctl, "create_desktop_shortcuts"):
             ctl.prepare()
@@ -993,7 +1265,8 @@ class LinuxSteamIntegrationTests(RuntimeFixture):
         (target / "savegame1/careerSavegame.xml").write_bytes(b"savegame")
         self.config.mkdir(parents=True)
         (self.config / "game.xml").write_bytes(b"server settings")
-        with mock.patch.object(pathlib.Path, "symlink_to") as link:
+        with mock.patch.object(ctl, "runtime_documents", return_value=target.parent.parent), \
+                mock.patch.object(pathlib.Path, "symlink_to") as link:
             ctl.prepare_proton_config(environment)
         link.assert_called_once_with(self.config, target_is_directory=True)
         self.assertEqual((self.config / "game.xml").read_bytes(), b"server settings")
@@ -1135,7 +1408,8 @@ class WindowsSteamIntegrationTests(RuntimeFixture):
         (target / "game.xml").write_bytes(b"game defaults")
         self.config.mkdir(parents=True)
         (self.config / "game.xml").write_bytes(b"server settings")
-        with mock.patch.object(pathlib.Path, "symlink_to") as link:
+        with mock.patch.object(ctl, "runtime_documents", return_value=target.parent.parent), \
+                mock.patch.object(pathlib.Path, "symlink_to") as link:
             ctl.prepare_proton_config(environment)
         link.assert_called_once_with(self.config, target_is_directory=True)
         self.assertEqual((self.config / "game.xml").read_bytes(), b"server settings")
@@ -1150,9 +1424,11 @@ class WindowsSteamIntegrationTests(RuntimeFixture):
 
     def test_prepare_dispatches_to_windows_bootstrap_not_giants(self):
         with mock.patch.multiple(ctl, prepare_windows_steam=mock.DEFAULT, ensure_prefix=mock.DEFAULT,
-                                 configure_runtime=mock.DEFAULT, create_desktop_shortcuts=mock.DEFAULT) as functions:
+                                 prepare_steam_profile=mock.DEFAULT, configure_runtime=mock.DEFAULT,
+                                 create_desktop_shortcuts=mock.DEFAULT) as functions:
             ctl.prepare()
         functions["prepare_windows_steam"].assert_called_once_with()
+        functions["prepare_steam_profile"].assert_called_once_with()
         functions["ensure_prefix"].assert_not_called()
 
     def test_image_pins_the_tested_wine_and_keeps_cef_sandbox(self):
@@ -1361,6 +1637,11 @@ class NativeSteamProbeTests(unittest.TestCase):
     def test_ready_session(self):
         result = self.probe()
         self.assertEqual((result.returncode, result.stdout.strip()), (0, "STEAM_SESSION_READY"))
+
+    def test_documents_lookup_does_not_require_steam_api_or_login(self):
+        result = self.probe(arguments=["--documents"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout.strip(), r"^FS25_DOCUMENTS=[A-Za-z]:[\\/].+")
 
     def test_not_logged_on(self):
         result = self.probe("offline")

@@ -36,10 +36,6 @@ DESKTOP_DIR = HOME / "Desktop"
 SERVER_EXE = GAME_DIR / "dedicatedServer.exe"
 GAME_EXE = GAME_DIR / "FarmingSimulator2025.exe"
 WINE_GAME_DIR = PREFIX / "drive_c" / "Program Files (x86)" / "Farming Simulator 2025"
-WINE_CONFIG_DIR = (
-    PREFIX / "drive_c" / "users" / os.environ.get("USER", "container")
-    / "Documents" / "My Games" / "FarmingSimulator2025"
-)
 PROTON_DIR = pathlib.Path("/opt/fs25/wine")
 STABLE_DIR = pathlib.Path("/opt/wine-stable")
 STEAM_WINE_DIR = pathlib.Path("/opt/wine-staging")
@@ -485,32 +481,67 @@ def proton_launch_context(directory: pathlib.Path, arguments: list[str], *, verb
 
 def prepare_proton_config(process_env: dict[str, str]) -> None:
     if steam_backend() == "windows":
-        target = pathlib.Path(process_env["WINEPREFIX"]) / "drive_c/users" / env("USER", "container") / "Documents/My Games/FarmingSimulator2025"
+        prefix = pathlib.Path(process_env["WINEPREFIX"])
+        command = [str(STEAM_WINE_DIR / "bin/wine"), str(STEAM_SESSION_HELPER), "--documents"]
     else:
-        target = pathlib.Path(process_env["STEAM_COMPAT_DATA_PATH"]) / "pfx/drive_c/users/steamuser/Documents/My Games/FarmingSimulator2025"
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.is_symlink() and target.resolve() == CONFIG_DIR.resolve():
+        prefix = pathlib.Path(process_env["STEAM_COMPAT_DATA_PATH"]) / "pfx"
+        command, _ = proton_launch_context(pathlib.Path(process_env["STEAM_COMPAT_INSTALL_PATH"]),
+                                          [str(STEAM_SESSION_HELPER), "--documents"])
+    bind_profile(command, process_env, prefix)
+
+
+def runtime_documents(command: list[str], process_env: dict[str, str], prefix: pathlib.Path) -> pathlib.Path:
+    """Ask this runtime's Windows shell, including Documents redirection."""
+    probe_env = process_env.copy()
+    probe_env.pop("PROTON_LOG", None)
+    try:
+        result = subprocess.run(command, env=probe_env, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("FS25 Documents lookup failed; existing profile retained") from exc
+    matches = [line.removeprefix("FS25_DOCUMENTS=").strip() for line in result.stdout.splitlines()
+               if line.startswith("FS25_DOCUMENTS=")]
+    if result.returncode != 0 or len(matches) != 1:
+        raise RuntimeError("FS25 Documents lookup returned no unique path; existing profile retained")
+    windows = pathlib.PureWindowsPath(matches[0])
+    if not windows.is_absolute() or not re.fullmatch(r"[a-zA-Z]:", windows.drive) or ".." in windows.parts:
+        raise RuntimeError("FS25 Documents lookup returned an invalid local path")
+    drive = windows.drive.lower()
+    mapping = prefix / "dosdevices" / drive
+    if mapping.is_dir():
+        base = mapping
+    elif drive == "c:":
+        base = prefix / "drive_c"
+    elif drive == "z:":
+        base = pathlib.Path("/")
+    else:
+        raise RuntimeError("FS25 Documents drive is not mapped")
+    documents = base.joinpath(*windows.parts[1:]).resolve()
+    if not documents.is_relative_to(HOME.resolve()):
+        raise RuntimeError("FS25 Documents must remain in persistent /home/container storage")
+    return documents
+
+
+def bind_profile(command: list[str], process_env: dict[str, str], prefix: pathlib.Path) -> None:
+    documents = runtime_documents(command, process_env, prefix)
+    target = documents / "My Games" / "FarmingSimulator2025"
+    link_persistent(CONFIG_DIR, target)
+    configure_profile_mods()
+    log(f"FS25 profile: {CONFIG_DIR}; Windows Documents profile: {target}")
+
+
+def configure_profile_mods() -> None:
+    """Uploaded PC profiles must not keep looking for mods on that PC's drive."""
+    (CONFIG_DIR / "mods").mkdir(parents=True, exist_ok=True)
+    path = CONFIG_DIR / "gameSettings.xml"
+    if not path.exists():
         return
-    if target.is_symlink() or (target.exists() and not target.is_dir()):
-        raise SteamNotReady(f"Unexpected FS25 Documents link: {target}; retain it and check its destination")
-    if target.exists():
-        # First normal game launch may have created defaults. Preserve them in
-        # the prefix; never replace existing server settings/savegames with them.
-        backup = target.with_name(target.name + ".before-fs25-link")
-        count = 1
-        while backup.exists():
-            backup = target.with_name(target.name + f".before-fs25-link-{count}")
-            count += 1
-        target.rename(backup)
-        for source in backup.rglob("*"):
-            destination = CONFIG_DIR / source.relative_to(backup)
-            if source.is_dir():
-                destination.mkdir(parents=True, exist_ok=True)
-            elif source.is_file() and not destination.exists():
-                shutil.copy2(source, destination)
-        log(f"First-run FS25 settings retained at {backup}; existing server data takes priority.")
-    target.symlink_to(CONFIG_DIR, target_is_directory=True)
+    root = load_or_create(path, "gameSettings")
+    override = root.find("modsDirectoryOverride")
+    if override is not None and true_value(override.get("active", "false")):
+        override.set("active", "false")
+        atomic_xml(path, root)
+        log("Disabled the uploaded mods-directory override; FS25 uses the persistent profile's mods directory.")
 
 
 def open_steam() -> None:
@@ -922,16 +953,56 @@ def configure_headless_wine() -> None:
 
 
 def link_persistent(source: pathlib.Path, target: pathlib.Path) -> None:
+    """Keep persistent files authoritative; retain the old profile for recovery."""
+    source = source.resolve()
+    resolved_target = target.resolve()
+    if not source.is_relative_to(HOME.resolve()) or not resolved_target.is_relative_to(HOME.resolve()):
+        raise RuntimeError("Persistent FS25 links must remain inside /home/container")
     source.mkdir(parents=True, exist_ok=True)
     target.parent.mkdir(parents=True, exist_ok=True)
-    if target.is_symlink() and target.resolve() == source.resolve():
+    if resolved_target == source:
         return
-    if target.exists() and target.is_dir() and not target.is_symlink():
-        shutil.copytree(target, source, dirs_exist_ok=True)
-    if target.is_symlink() or target.is_file():
-        target.unlink()
-    elif target.exists():
-        shutil.rmtree(target)
+    # Moving a source's ancestor, or linking a profile into itself, loses data
+    # or creates a recursive tree. Refuse before renaming anything.
+    if (source.is_relative_to(target.absolute()) or target.absolute().is_relative_to(source)
+            or source.is_relative_to(resolved_target)
+            or (not target.is_symlink() and resolved_target.is_relative_to(source))):
+        raise RuntimeError("Overlapping FS25 persistent directories")
+    if target.exists() or target.is_symlink():
+        if not target.is_dir():
+            raise RuntimeError(f"Unexpected FS25 profile path: {target}; existing data retained")
+        backup = target.with_name(target.name + ".before-fs25-link")
+        count = 1
+        while backup.exists() or backup.is_symlink():
+            backup = target.with_name(target.name + f".before-fs25-link-{count}")
+            count += 1
+
+        def seed_missing(old: pathlib.Path, new: pathlib.Path) -> None:
+            for item in old.iterdir():
+                destination = new / item.name
+                # Never follow uploaded links, overwrite existing files, or
+                # combine two different versions of the same savegame.
+                if item.is_symlink() or destination.is_symlink():
+                    continue
+                if not destination.exists():
+                    if item.is_dir():
+                        shutil.copytree(item, destination, symlinks=True)
+                    else:
+                        shutil.copy2(item, destination)
+                elif item.is_dir() and destination.is_dir() and not re.fullmatch(r"savegame[0-9]+", item.name):
+                    seed_missing(item, destination)
+
+        # Copy before rename: a full disk or copy error leaves the live path
+        # intact. A failed symlink restores it as well.
+        seed_missing(target, source)
+        target.rename(backup)
+        try:
+            target.symlink_to(source, target_is_directory=True)
+        except OSError:
+            backup.rename(target)
+            raise
+        log(f"Previous FS25 directory retained at {backup}; persistent files take priority.")
+        return
     target.symlink_to(source, target_is_directory=True)
 
 
@@ -963,13 +1034,14 @@ def validated_port(name: str, default: int) -> str:
 
 
 def load_or_create(path: pathlib.Path, root_name: str) -> ET.Element:
-    if path.is_file():
+    if path.exists():
         try:
             root = ET.parse(path).getroot()
-            if root.tag == root_name:
-                return root
-        except (ET.ParseError, OSError):
-            pass
+        except (ET.ParseError, OSError) as exc:
+            raise RuntimeError(f"Invalid FS25 XML: {path}; existing file retained") from exc
+        if root.tag != root_name:
+            raise RuntimeError(f"Unexpected XML root in {path}: expected {root_name}; existing file retained")
+        return root
     return ET.Element(root_name)
 
 
@@ -1021,6 +1093,7 @@ def web_credentials() -> tuple[str, str]:
 
 def configure() -> None:
     ensure_directories()
+    configure_profile_mods()
     directory = game_directory()
     web_port = validated_port("WEB_PORT", 7999)
     game_port = validated_port("SERVER_PORT", 10823)
@@ -1046,6 +1119,12 @@ def configure() -> None:
     atomic_xml(server_path, server)
 
     config_path = DEDICATED_DIR / "dedicatedServerConfig.xml"
+    # Some uploads place this file beside mods/savegames instead of in the
+    # dedicated_server subdirectory. Retain the uploaded original.
+    uploaded_config = CONFIG_DIR / "dedicatedServerConfig.xml"
+    if not config_path.exists() and uploaded_config.is_file():
+        load_or_create(uploaded_config, "gameserver")
+        shutil.copy2(uploaded_config, config_path)
     gameserver = load_or_create(config_path, "gameserver")
     settings = child(gameserver, "settings")
     requested_map = env("SERVER_MAP").strip()
@@ -1095,6 +1174,7 @@ def configure() -> None:
     selected_map = settings.findtext("mapID") or "MapUS"
     overrides = ", ".join(managed) if managed else "none"
     log(f"Configuration ready: web={web_port} game={game_port} map={selected_map}; panel overrides: {overrides}")
+    log(f"Persistent profile: {CONFIG_DIR}; selected savegame slot: {settings.findtext('savegame_index')}")
     log("Empty optional panel variables preserve settings saved in the GIANTS Web Interface.")
 
 
@@ -1191,14 +1271,41 @@ def prepare() -> None:
             prepare_windows_steam()
         else:
             prepare_steam_layout()
+        prepare_steam_profile()
         # Neither backend creates/repairs the separate GIANTS prefix.
         return
     ensure_prefix()
     configure_headless_wine()
     link_persistent(GAME_DIR, WINE_GAME_DIR)
-    link_persistent(CONFIG_DIR, WINE_CONFIG_DIR)
+    bind_profile(["wine", str(STEAM_SESSION_HELPER), "--documents"], dict(os.environ), PREFIX)
     create_desktop_shortcuts()
     configure()
+
+
+def prepare_steam_profile() -> None:
+    """Bind before normal Steam/game launch too, not only after API login."""
+    try:
+        directory = game_directory()
+    except SteamNotReady:
+        directory = None
+    if steam_backend() == "windows":
+        process_env = windows_steam_environment()
+    else:
+        if directory is None:
+            return
+        try:
+            _, process_env = proton_launch_context(directory, [])
+        except SteamNotReady:
+            log("FS25 profile binding waits for Steam's real Proton first-run setup.")
+            return
+    try:
+        require_server_stopped()
+    except ServerAlreadyRunning:
+        log("FS25 is already active; profile and Egg settings remain unchanged until the next server start.")
+        return
+    prepare_proton_config(process_env)
+    if directory is not None:
+        configure()
 
 
 def archive_command(archive: pathlib.Path, output: pathlib.Path) -> list[str]:
@@ -2248,7 +2355,7 @@ def main() -> int:
             # Legacy commands remain available, but cannot mutate installation
             # files while an update holds the exclusive lease.
             with activity_lock(exclusive=True):
-                if args.command in {"install", "install-dlcs"}:
+                if args.command in {"prepare", "configure", "install", "install-dlcs"}:
                     require_server_stopped()
                 result = actions[args.command]()
         else:

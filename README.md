@@ -86,6 +86,11 @@ pull it on the node and fully stop/start the container.
 | Logs | `/home/container/logs` |
 
 Upload mod ZIPs without extracting them. Stop the game before replacing savegames.
+Keep `mods`, `savegame1`, etc. inside the existing `config/FarmingSimulator2025`
+folder. The runtime links the game's actual Documents profile to this folder;
+you do not need to copy files into Wine. Imported custom mod-folder overrides
+are disabled so the game reads this profile's `mods` folder. Select the intended
+savegame slot in GIANTS or with `SAVEGAME_INDEX`; uploaded slots are not renamed.
 Troubleshooting and release checks: [maintainer guide](docs/MAINTAINER.md).
 
 ## License

@@ -5,8 +5,10 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shlobj.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <wchar.h>
 
 typedef bool (__cdecl *steam_init_fn)(void);
 typedef void (__cdecl *steam_void_fn)(void);
@@ -15,6 +17,19 @@ typedef bool (__cdecl *steam_logged_on_fn)(void *);
 
 int wmain(int argc, wchar_t **argv)
 {
+    /* Query the same shell folder as the game, not a guessed Wine username. */
+    if (argc == 2 && wcscmp(argv[1], L"--documents") == 0) {
+        wchar_t path[MAX_PATH];
+        char utf8[MAX_PATH * 4];
+        if (SHGetFolderPathW(NULL, CSIDL_PERSONAL | CSIDL_FLAG_CREATE, NULL,
+                            SHGFP_TYPE_CURRENT, path) != S_OK ||
+            !WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL)) {
+            puts("FS25_DOCUMENTS_LOOKUP_FAILED");
+            return 2;
+        }
+        printf("FS25_DOCUMENTS=%s\n", utf8);
+        return 0;
+    }
     if (argc != 2) {
         puts("STEAM_API_PATH_REQUIRED");
         return 2;
