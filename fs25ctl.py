@@ -11,6 +11,7 @@ import os
 import pathlib
 import platform
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -41,11 +42,17 @@ WINE_CONFIG_DIR = (
 )
 PROTON_DIR = pathlib.Path("/opt/fs25/wine")
 STABLE_DIR = pathlib.Path("/opt/wine-stable")
+STEAM_WINE_DIR = pathlib.Path("/opt/wine-staging")
+STEAM_WINDOWS_PREFIX = HOME / ".fs25steam"
+STEAM_WINDOWS_DIR = HOME / "steam" / "library"
+STEAM_SETUP = pathlib.Path("/opt/fs25/SteamSetup.exe")
 STEAM_APP_ID = "2300320"
 STEAM_DIR = HOME / ".local" / "share" / "Steam"
 STEAM_LIBRARY_DIR = STEAM_DIR
 STEAM_LAUNCHER = pathlib.Path("/usr/bin/steam")
 STEAM_SESSION_HELPER = pathlib.Path("/opt/fs25/steam-session.exe")
+STEAMCMD_BOOTSTRAP = pathlib.Path("/opt/fs25/steamcmd")
+PROC_DIR = pathlib.Path("/proc")
 
 
 class SteamNotReady(RuntimeError):
@@ -54,6 +61,41 @@ class SteamNotReady(RuntimeError):
 
 class ServerAlreadyRunning(RuntimeError):
     """Another controller or game already owns the server start."""
+
+
+class MaintenanceBusy(RuntimeError):
+    """A start/update conflicts with another operation or an unfinished update."""
+
+
+@contextlib.contextmanager
+def activity_lock(*, exclusive: bool = False):
+    """Short shared startup leases; exclusive stop/update lease. Never unlink."""
+    import fcntl
+
+    HOME.mkdir(parents=True, exist_ok=True)
+    with (HOME / ".fs25-maintenance.lock").open("a") as handle:
+        try:
+            fcntl.flock(handle.fileno(), (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise MaintenanceBusy("Another FS25 start, installation or maintenance operation is active; retry after it finishes") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def require_update_complete() -> None:
+    if (HOME / ".fs25-update-incomplete").exists():
+        raise MaintenanceBusy("The previous update was interrupted or failed. Run Update FS25 again before starting the server")
+
+
+def steam_download_mode() -> str:
+    mode = env("STEAM_DOWNLOAD_MODE", "client").strip().lower()
+    if mode not in {"client", "steamcmd"}:
+        raise ValueError("STEAM_DOWNLOAD_MODE must be client or steamcmd")
+    if mode == "steamcmd" and steam_backend() != "windows":
+        raise ValueError("SteamCMD content currently requires the Windows Steam/Wine runtime; native Proton needs its own first-run metadata")
+    return mode
 
 
 def log(message: str) -> None:
@@ -75,18 +117,38 @@ def installation_source() -> str:
     return source
 
 
+def steam_backend() -> str:
+    # Native Steam requires user namespaces that a normal Wings container does
+    # not grant. Windows Steam/Wine is the image's namespace-free default.
+    backend = env("FS25_STEAM_BACKEND", "windows").strip().lower()
+    if backend not in {"windows", "linux"}:
+        raise ValueError("FS25_STEAM_BACKEND must be windows or linux")
+    return backend
+
+
+def steam_client_directory() -> pathlib.Path:
+    return STEAM_WINDOWS_DIR if steam_backend() == "windows" else STEAM_DIR
+
+
 def read_vdf(path: pathlib.Path) -> dict:
     """Read Steam's text KeyValues files without executing directives or includes."""
     if path.stat().st_size > 2 * 1024 * 1024:
         raise ValueError(f"Steam metadata is too large: {path.name}")
     text = path.read_text(encoding="utf-8-sig")
+    return parse_vdf(text)
+
+
+def parse_vdf(text: str) -> dict:
+    """The same strict parser also handles public SteamCMD app information."""
+    if len(text) > 2 * 1024 * 1024:
+        raise ValueError("Steam metadata is too large")
     token = re.compile(r'\s+|//[^\n]*|"(?:\\.|[^"\\])*"|[{}]|[^\s{}"]+')
     tokens = []
     offset = 0
     while offset < len(text):
         match = token.match(text, offset)
         if match is None:
-            raise ValueError(f"Malformed Steam metadata: {path.name}")
+            raise ValueError("Malformed Steam metadata")
         value = match.group()
         offset = match.end()
         if value.isspace() or value.startswith("//"):
@@ -101,7 +163,7 @@ def read_vdf(path: pathlib.Path) -> dict:
     def object_values(nested: bool = False, depth: int = 0) -> dict:
         nonlocal position
         if depth > 16:
-            raise ValueError(f"Steam metadata is too deeply nested: {path.name}")
+            raise ValueError("Steam metadata is too deeply nested")
         result = {}
         while position < len(tokens):
             key, structural = tokens[position]
@@ -109,19 +171,19 @@ def read_vdf(path: pathlib.Path) -> dict:
             if structural and key == "}" and nested:
                 return result
             if structural or position >= len(tokens):
-                raise ValueError(f"Malformed Steam metadata: {path.name}")
+                raise ValueError("Malformed Steam metadata")
             value, structural = tokens[position]
             position += 1
             if structural:
                 if value != "{":
-                    raise ValueError(f"Malformed Steam metadata: {path.name}")
+                    raise ValueError("Malformed Steam metadata")
                 value = object_values(True, depth + 1)
             key = key.casefold()
             if key in result:
-                raise ValueError(f"Duplicate Steam metadata key: {path.name}")
+                raise ValueError("Duplicate Steam metadata key")
             result[key] = value
         if nested:
-            raise ValueError(f"Incomplete Steam metadata: {path.name}")
+            raise ValueError("Incomplete Steam metadata")
         return result
 
     return object_values()
@@ -129,7 +191,24 @@ def read_vdf(path: pathlib.Path) -> dict:
 
 def persistent_library_path(value: str) -> pathlib.Path:
     """Resolve native libraries without translating paths through a Wine prefix."""
-    path = pathlib.Path(value)
+    if steam_backend() == "windows" and not value.startswith("/"):
+        windows = pathlib.PureWindowsPath(value)
+        if not windows.is_absolute() or not re.fullmatch(r"[a-zA-Z]:", windows.drive):
+            raise ValueError("Steam library must use an absolute local drive path")
+        if ".." in windows.parts:
+            raise ValueError("Steam library path must not contain parent traversal")
+        drive = windows.drive.lower()
+        if drive == "c:":
+            path = STEAM_WINDOWS_PREFIX / "drive_c"
+        elif drive == "z:":
+            path = pathlib.Path("/")
+        else:
+            path = STEAM_WINDOWS_PREFIX / "dosdevices" / drive
+            if not path.is_dir():
+                raise ValueError("Steam library drive is not mapped in this Wine prefix")
+        path = path.joinpath(*windows.parts[1:])
+    else:
+        path = pathlib.Path(value)
     if not path.is_absolute():
         raise ValueError("Linux Steam library path must be absolute")
     path = path.resolve()
@@ -139,8 +218,9 @@ def persistent_library_path(value: str) -> pathlib.Path:
 
 
 def steam_libraries() -> list[pathlib.Path]:
-    libraries = [STEAM_DIR, STEAM_LIBRARY_DIR]
-    for metadata in (STEAM_DIR / "steamapps/libraryfolders.vdf", STEAM_DIR / "config/libraryfolders.vdf"):
+    client = steam_client_directory()
+    libraries = [client, STEAM_LIBRARY_DIR] if steam_backend() == "linux" else [client]
+    for metadata in (client / "steamapps/libraryfolders.vdf", client / "config/libraryfolders.vdf"):
         if not metadata.is_file():
             continue
         folders = read_vdf(metadata).get("libraryfolders", {})
@@ -172,7 +252,8 @@ def steam_libraries() -> list[pathlib.Path]:
 def steam_game_directory() -> pathlib.Path:
     """Require a finished Steam manifest, not just files left by a partial download."""
     try:
-        libraries = steam_libraries()
+        cli = steam_download_mode() == "steamcmd"
+        libraries = [HOME / "steamcmd/game"] if cli else steam_libraries()
         candidates = []
         pending = None
         for library in libraries:
@@ -184,10 +265,10 @@ def steam_game_directory() -> pathlib.Path:
             if not isinstance(state, dict) or state.get("appid") != STEAM_APP_ID:
                 raise ValueError("FS25 Steam manifest has an unexpected app ID")
             folder = state.get("installdir", "")
-            if not isinstance(folder, str) or not folder or folder in {".", ".."} or any(char in folder for char in '/\\:'):
+            if not cli and (not isinstance(folder, str) or not folder or folder in {".", ".."} or any(char in folder for char in '/\\:')):
                 raise ValueError("FS25 Steam installation directory is invalid")
-            common = (steamapps / "common").resolve()
-            directory = (common / folder).resolve()
+            common = library.resolve() if cli else (steamapps / "common").resolve()
+            directory = common if cli else (common / folder).resolve()
             if not directory.is_relative_to(common) or not directory.is_relative_to(HOME.resolve()):
                 raise ValueError("FS25 Steam installation must remain inside /home/container")
             downloading = steamapps / "downloading" / STEAM_APP_ID
@@ -223,20 +304,35 @@ def game_directory() -> pathlib.Path:
 
 
 def prepare_steam_layout() -> None:
+    if steam_backend() == "windows":
+        target = STEAM_WINDOWS_PREFIX / "drive_c" / "Steam"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        STEAM_WINDOWS_DIR.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink() and target.resolve() == STEAM_WINDOWS_DIR.resolve():
+            return
+        if target.exists() or target.is_symlink():
+            raise RuntimeError(f"Unexpected Steam directory at {target}; existing data retained")
+        target.symlink_to(STEAM_WINDOWS_DIR, target_is_directory=True)
+        return
     # Valve's launcher uses this default path, wholly inside the persistent HOME.
     # Do not reuse Windows client files or rewrite Steam's own library metadata.
     STEAM_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def steam_executable() -> pathlib.Path | None:
+    if steam_backend() == "windows":
+        return next((path for name in ("steam.exe", "Steam.exe")
+                     if (path := STEAM_WINDOWS_DIR / name).is_file()), None)
     return STEAM_LAUNCHER if STEAM_LAUNCHER.is_file() else None
 
 
 def steam_command(*, silent: bool = False) -> list[str]:
     executable = steam_executable()
     if executable is None:
-        raise RuntimeError("The native Linux Steam launcher is missing; pull the updated FS25 image")
+        raise RuntimeError("The Steam launcher is missing; pull the updated FS25 image")
     gui = [] if true_value(env("FS25_STEAM_GPU", "false")) else ["-cef-disable-gpu"]
+    if steam_backend() == "windows":
+        return [*steam_client_affinity(), str(STEAM_WINE_DIR / "bin/wine"), str(executable), *gui, *(["-silent"] if silent else [])]
     return [str(executable), *gui, *(["-silent"] if silent else [])]
 
 
@@ -248,7 +344,7 @@ def clean_steam_environment() -> dict[str, str]:
             "LD_LIBRARY_PATH", "LD_PRELOAD", "SteamAppId", "SteamGameId", "SteamOverlayGameId",
         }:
             result.pop(name, None)
-    bins = {str(PROTON_DIR / "bin"), str(STABLE_DIR / "bin")}
+    bins = {str(PROTON_DIR / "bin"), str(STABLE_DIR / "bin"), str(STEAM_WINE_DIR / "bin")}
     result["PATH"] = os.pathsep.join(part for part in result.get("PATH", os.defpath).split(os.pathsep) if part not in bins)
     result["HOME"] = str(HOME)
     result["XDG_DATA_HOME"] = str(HOME / ".local/share")
@@ -256,15 +352,84 @@ def clean_steam_environment() -> dict[str, str]:
 
 
 def steam_launch_context(*, silent: bool = False) -> tuple[list[str], pathlib.Path, dict[str, str]]:
-    """Native client: neither wine nor SteamSetup.exe participates in GUI startup."""
+    """Shared desktop/panel launch; the installed client never reruns its installer."""
     command = steam_command(silent=silent)
-    cwd = HOME
-    launch_env = clean_steam_environment()
-    log(f"Starting native Linux Steam: {command[0]}")
+    windows = steam_backend() == "windows"
+    cwd = STEAM_WINDOWS_DIR if windows else HOME
+    launch_env = windows_steam_environment() if windows else clean_steam_environment()
+    wine_index = command.index(str(STEAM_WINE_DIR / "bin/wine")) if windows else 0
+    log(f"Starting {steam_backend()} Steam: {command[wine_index + 1] if windows else command[0]}")
     log(f"Steam working directory: {cwd}; UI: {'background' if silent else 'visible'}.")
-    log(f"Steam client logs: {STEAM_DIR / 'logs'}.")
+    log(f"Steam client logs: {steam_client_directory() / 'logs'}.")
     log("An open terminal or updater is not proof that the Steam login/library window is ready.")
     return command, cwd, launch_env
+
+
+def windows_steam_environment() -> dict[str, str]:
+    result = clean_steam_environment()
+    bins = str(STEAM_WINE_DIR / "bin")
+    result.update({
+        "PATH": bins + os.pathsep + result.get("PATH", os.defpath),
+        "WINEPREFIX": str(STEAM_WINDOWS_PREFIX), "WINEARCH": "win64",
+        "WINESERVER": str(STEAM_WINE_DIR / "bin/wineserver"),
+        "WINEDLLOVERRIDES": "mscoree=d", "WINEDEBUG": "-all,err+all",
+    })
+    return result
+
+
+def steam_client_affinity() -> list[str]:
+    # Derive CPU IDs from the actual container allowance, never assume CPU 0
+    # exists. This applies to the client/initializer, not the dedicated server.
+    if not hasattr(os, "sched_getaffinity"):
+        return []
+    allowed = sorted(os.sched_getaffinity(0))[:2]
+    if not allowed:
+        raise RuntimeError("The container has no allowed CPU for Steam")
+    return ["/usr/bin/taskset", "-c", ",".join(map(str, allowed))]
+
+
+def prepare_windows_steam() -> None:
+    """Bootstrap only this backend's prefix; retain GIANTS/native Steam data."""
+    import fcntl
+
+    ensure_directories()
+    with (HOME / ".fs25-steam-setup.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        process_env = windows_steam_environment()
+        wine = str(STEAM_WINE_DIR / "bin/wine")
+        if not pathlib.Path(wine).is_file():
+            raise RuntimeError("Wine 11.19 for Steam is missing; pull the updated FS25 image")
+        try:
+            initialized = prefix_files_exist(STEAM_WINDOWS_PREFIX)
+        except OSError:
+            initialized = False
+        if not initialized:
+            status = run_logged([*steam_client_affinity(), str(STEAM_WINE_DIR / "bin/wineboot"), "--init"],
+                                LOG_DIR / "steam-wineboot.log", 240, process_env=process_env)
+            try:
+                initialized = prefix_files_exist(STEAM_WINDOWS_PREFIX)
+            except OSError:
+                initialized = False
+            if status != 0 or not initialized:
+                raise RuntimeError(f"Steam Wine prefix initialization exited with status {status}; data retained")
+        prepare_steam_layout()
+        if steam_executable() is None:
+            if not STEAM_SETUP.is_file():
+                raise RuntimeError("The bundled Steam installer is missing; pull the updated FS25 image")
+            log("Installing the official Steam client into persistent storage.")
+            # NSIS /D must be last. The normal client performs its own update.
+            status = run_logged([*steam_client_affinity(), wine, str(STEAM_SETUP), "/S", r"/D=C:\Steam"],
+                                LOG_DIR / "steam-install.log", 240, process_env=process_env)
+            if status != 0 or steam_executable() is None:
+                raise RuntimeError(f"Steam installation exited with status {status}; check logs/steam-install.log")
+
+
+def steam_game_launch_context(directory: pathlib.Path, arguments: list[str]) -> tuple[list[str], dict[str, str]]:
+    if steam_backend() == "linux":
+        return proton_launch_context(directory, arguments)
+    result = windows_steam_environment()
+    result.update({"SteamAppId": STEAM_APP_ID, "SteamGameId": STEAM_APP_ID})
+    return [str(STEAM_WINE_DIR / "bin/wine"), *arguments], result
 
 
 def proton_launch_context(directory: pathlib.Path, arguments: list[str], *, verb: str = "run") -> tuple[list[str], dict[str, str]]:
@@ -319,7 +484,10 @@ def proton_launch_context(directory: pathlib.Path, arguments: list[str], *, verb
 
 
 def prepare_proton_config(process_env: dict[str, str]) -> None:
-    target = pathlib.Path(process_env["STEAM_COMPAT_DATA_PATH"]) / "pfx/drive_c/users/steamuser/Documents/My Games/FarmingSimulator2025"
+    if steam_backend() == "windows":
+        target = pathlib.Path(process_env["WINEPREFIX"]) / "drive_c/users" / env("USER", "container") / "Documents/My Games/FarmingSimulator2025"
+    else:
+        target = pathlib.Path(process_env["STEAM_COMPAT_DATA_PATH"]) / "pfx/drive_c/users/steamuser/Documents/My Games/FarmingSimulator2025"
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.is_symlink() and target.resolve() == CONFIG_DIR.resolve():
@@ -348,11 +516,16 @@ def prepare_proton_config(process_env: dict[str, str]) -> None:
 def open_steam() -> None:
     if installation_source() != "steam":
         raise RuntimeError("Select INSTALL_SOURCE=steam in the panel to use the Steam installation")
-    prepare()
-    log("Use Steam in noVNC to sign in, complete Steam Guard and install/manage FS25 and its DLCs.")
-    command, cwd, launch_env = steam_launch_context()
-    os.chdir(cwd)
-    os.execvpe(command[0], command, launch_env)
+    with activity_lock():
+        prepare()
+        ensure_directories()
+        log("Use Steam in noVNC to sign in, complete Steam Guard and install/manage FS25 and its DLCs.")
+        command, cwd, launch_env = steam_launch_context()
+        # The client is not owned by this terminal. Maintenance can shut it down
+        # through Steam's normal -shutdown command, without killing the desktop.
+        with (LOG_DIR / "steam-launch.log").open("a", encoding="utf-8") as output:
+            subprocess.Popen(command, cwd=cwd, env=launch_env, stdin=subprocess.DEVNULL,
+                             stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
 
 
 def ensure_steam_appid(directory: pathlib.Path) -> None:
@@ -382,14 +555,21 @@ def ensure_steam_appid(directory: pathlib.Path) -> None:
 def steam_session_ready(directory: pathlib.Path, *, timeout: float = 25) -> bool:
     """Ask the installed game's Steam API; saved login files are not session proof."""
     deadline = time.monotonic() + timeout
-    if not any((STEAM_DIR / name).is_file() for name in ("linux64/steamclient.so", "linux32/steamclient.so")):
+    if steam_backend() == "windows" and steam_executable() is None:
+        return False
+    if steam_backend() == "linux" and not any((STEAM_DIR / name).is_file() for name in ("linux64/steamclient.so", "linux32/steamclient.so")):
         return False
     if not STEAM_SESSION_HELPER.is_file():
         raise RuntimeError("Steam session checker is missing; pull the updated FS25 image")
     api = next((directory / name for name in ("x64/steam_api64.dll", "steam_api64.dll") if (directory / name).is_file()), None)
     if api is None:
         raise SteamNotReady("FS25's Steam API is missing; verify the game files in Steam")
-    path_command, probe_env = proton_launch_context(directory, [str(api)], verb="getcompatpath")
+    if steam_backend() == "windows":
+        path_command = [str(STEAM_WINE_DIR / "bin/winepath"), "-w", str(api)]
+        probe_command, probe_env = steam_game_launch_context(directory, [str(STEAM_SESSION_HELPER)])
+    else:
+        path_command, probe_env = proton_launch_context(directory, [str(api)], verb="getcompatpath")
+        probe_command = [*path_command[:2], "run", str(STEAM_SESSION_HELPER)]
     # Proton logging redirects the helper's stdout to a file. Readiness needs
     # its literal stdout marker; keep PROTON_LOG only for the real server.
     probe_env.pop("PROTON_LOG", None)
@@ -404,7 +584,7 @@ def steam_session_ready(directory: pathlib.Path, *, timeout: float = 25) -> bool
         windows_path = subprocess.run(path_command, cwd=directory, env=probe_env, capture_output=True, text=True, timeout=remaining(10), check=True).stdout.strip()
         if not windows_path:
             raise RuntimeError("Wine returned an empty Steam API path")
-        probe_command = [*path_command[:2], "run", str(STEAM_SESSION_HELPER), windows_path]
+        probe_command = [*probe_command, windows_path]
         result = subprocess.run(
             probe_command, cwd=directory,
             capture_output=True, text=True, timeout=remaining(15), env=probe_env,
@@ -415,7 +595,7 @@ def steam_session_ready(directory: pathlib.Path, *, timeout: float = 25) -> bool
         return True
     if result.returncode == 1:
         return False
-    raise RuntimeError(f"Steam API session check failed (exit {result.returncode}; {result.stdout.strip()}; {result.stderr.strip()}); check FS25/Proton files and logs")
+    raise RuntimeError(f"Steam API session check failed (exit {result.returncode}; {result.stdout.strip()}; {result.stderr.strip()}); check FS25/runtime files and logs")
 
 
 def shutdown_steam() -> None:
@@ -423,7 +603,12 @@ def shutdown_steam() -> None:
     if executable is None:
         return
     try:
-        subprocess.run([str(executable), "-shutdown"], cwd=HOME, env=clean_steam_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        if steam_backend() == "windows":
+            command = [*steam_client_affinity(), str(STEAM_WINE_DIR / "bin/wine"), str(executable), "-shutdown"]
+            process_env = windows_steam_environment()
+        else:
+            command, process_env = [str(executable), "-shutdown"], clean_steam_environment()
+        subprocess.run(command, cwd=steam_client_directory(), env=process_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         log("Steam shutdown did not finish within 10 seconds; container cleanup continues.")
 
@@ -975,9 +1160,14 @@ def create_desktop_shortcuts() -> None:
     ensure_directories()
     configure_terminal()
     steam = installation_source() == "steam"
-    write_desktop_file("fs25-install.desktop", "Open Steam / install FS25" if steam else "Install / activate FS25", "/opt/fs25/fs25ctl.py install", "system-software-install")
-    write_desktop_file("fs25-server.desktop", "Start FS25 web server", "/opt/fs25/fs25ctl.py start-webserver", "applications-games")
-    write_desktop_file("fs25-dlcs.desktop", "Manage FS25 DLCs in Steam" if steam else "Install FS25 DLCs", "/opt/fs25/fs25ctl.py install-dlcs", "system-software-install")
+    cli = steam and steam_download_mode() == "steamcmd"
+    title = "Install FS25 with SteamCMD" if cli else "Open Steam / install FS25" if steam else "Install / activate FS25"
+    write_desktop_file("fs25-install.desktop", title, "/opt/fs25/fs25ctl.py install", "system-software-install")
+    write_desktop_file("fs25-server.desktop", "Start FS25 web server / view log", "/opt/fs25/fs25ctl.py launch-webserver", "applications-games")
+    write_desktop_file("fs25-stop.desktop", "Stop FS25 web server", "/opt/fs25/fs25ctl.py stop-server", "process-stop")
+    write_desktop_file("fs25-update.desktop", "Update FS25", "/opt/fs25/fs25ctl.py update", "system-software-update")
+    title = "Update owned DLCs with SteamCMD" if cli else "Manage FS25 DLCs in Steam" if steam else "Install FS25 DLCs"
+    write_desktop_file("fs25-dlcs.desktop", title, "/opt/fs25/fs25ctl.py install-dlcs", "system-software-install")
     steam_shortcut = DESKTOP_DIR / "fs25-steam.desktop"
     if steam:
         write_desktop_file(steam_shortcut.name, "Steam", "/opt/fs25/fs25ctl.py steam", "applications-games")
@@ -996,10 +1186,12 @@ def create_desktop_shortcuts() -> None:
 def prepare() -> None:
     configure_runtime()
     if installation_source() == "steam":
-        prepare_steam_layout()
         create_desktop_shortcuts()
-        # GUI startup must not wait for Wine or create/repair a GIANTS prefix.
-        # Steam creates FS25's own compatdata prefix on the first game launch.
+        if steam_backend() == "windows":
+            prepare_windows_steam()
+        else:
+            prepare_steam_layout()
+        # Neither backend creates/repairs the separate GIANTS prefix.
         return
     ensure_prefix()
     configure_headless_wine()
@@ -1091,7 +1283,7 @@ def create_slice_aliases(installer: pathlib.Path) -> None:
 
 def install() -> None:
     if installation_source() == "steam":
-        open_steam()
+        update() if steam_download_mode() == "steamcmd" else open_steam()
         return
     prepare()
     required_gib = int(env("REQUIRED_SPACE_GB", "50"))
@@ -1164,6 +1356,9 @@ def dlc_name(path: pathlib.Path) -> str:
 
 def install_dlcs() -> None:
     if installation_source() == "steam":
+        if steam_download_mode() == "steamcmd":
+            update()
+            return
         log("Manage owned FS25 DLCs in Steam: Library > FS25 > Properties > DLC. Finish downloads before restarting the server.")
         open_steam()
         return
@@ -1269,6 +1464,308 @@ def patch_web() -> None:
         path.write_text(content, encoding="utf-8")
 
 
+def matching_processes(pattern: str) -> list[int]:
+    result = subprocess.run(["pgrep", "-u", str(os.getuid()), "-i", "-f", pattern],
+                            capture_output=True, text=True, check=False)
+    if result.returncode not in {0, 1}:
+        raise MaintenanceBusy("Process inspection failed; the update has not been started")
+    return [int(pid) for pid in result.stdout.split()] if result.returncode == 0 else []
+
+
+STEAM_PROCESS_PATTERN = r"(^|[/\\ ])(steam(\.exe)?|steamwebhelper(\.exe)?|steamcmd(\.sh)?)(\s|$)"
+INSTALLER_PROCESS_PATTERN = r"(^|[/\\ ])(setup|steamsetup|FarmingSimulator2025Setup)\.exe(\s|$)"
+
+
+def require_update_idle() -> None:
+    if game_server_running() or webserver_running() or server_owner() is not None:
+        raise MaintenanceBusy("An FS25 game/web process is still running; no update will be started")
+    if matching_processes(INSTALLER_PROCESS_PATTERN):
+        raise MaintenanceBusy("An installer is still running; finish or close it before updating")
+
+
+def stop_update_clients() -> None:
+    # Never kill an existing SteamCMD download or an installer. The caller holds
+    # the exclusive lease, so no managed start/installation can race these checks.
+    if matching_processes(r"(^|[/\\ ])steamcmd(\.sh)?(\s|$)"):
+        raise MaintenanceBusy("SteamCMD is already running; close its session before updating")
+    shutdown_steam()
+    deadline = time.monotonic() + 20
+    while matching_processes(STEAM_PROCESS_PATTERN):
+        if time.monotonic() >= deadline:
+            raise MaintenanceBusy("Steam has not exited. Close it using Steam > Exit, then retry; no processes were force-killed")
+        time.sleep(0.5)
+
+
+def interactive_process(command: list[str], *, cwd: pathlib.Path,
+                        process_env: dict[str, str] | None = None, capture: bool = False) -> str:
+    """A real controlling PTY preserves SteamCMD's password/Guard echo rules.
+
+    Forward input without retaining/logging it. Only the child's output is
+    captured, in bounded memory, including prompts without a newline.
+    """
+    import errno
+    import fcntl
+    import pty
+    import termios
+    import tty
+
+    process = None
+    previous = {}
+    data = bytearray()
+    master = slave = stdin = attributes = None
+
+    def child_terminal():
+        # This CLI is single-threaded. Give the child its own terminal/session
+        # rather than relying on /dev/tty after start_new_session has detached it.
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+    def cancel(_signum, _frame):
+        raise KeyboardInterrupt
+
+    try:
+        stdin = sys.stdin.fileno()
+        attributes = termios.tcgetattr(stdin)
+        master, slave = pty.openpty()
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            previous[sig] = signal.signal(sig, cancel)
+        size = fcntl.ioctl(stdin, termios.TIOCGWINSZ, b"\0" * 8)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, size)
+        tty.setraw(stdin)
+        process = subprocess.Popen(command, cwd=cwd, env=process_env, stdin=slave,
+                                   stdout=slave, stderr=slave, preexec_fn=child_terminal, close_fds=True)
+        os.close(slave)
+        slave = None
+        deadline = time.monotonic() + 21600
+        input_open = True
+        while True:
+            ready, _, _ = select.select([master, stdin] if input_open else [master], [], [], 0.5)
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Update session exceeded six hours; partial files are retained for retry")
+            if stdin in ready:
+                incoming = os.read(stdin, 4096)
+                os.write(master, incoming if incoming else b"\x04")
+                input_open = bool(incoming)
+            if master in ready:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    break  # Linux PTY EOF once its slave closes
+                if not chunk:
+                    break
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+                if capture:
+                    data.extend(chunk)
+                    if len(data) > 4 * 1024 * 1024:
+                        raise RuntimeError("SteamCMD metadata output exceeded the allowed size")
+        status = process.wait(timeout=10)
+        if status != 0:
+            raise RuntimeError(f"Update process exited with status {status}; installation remains blocked until a successful retry")
+        return data.decode("utf-8", errors="replace")
+    finally:
+        try:
+            if process is not None and process.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+        finally:
+            for descriptor in (master, slave):
+                if descriptor is not None:
+                    os.close(descriptor)
+            if attributes is not None:
+                with contextlib.suppress(OSError):
+                    termios.tcsetattr(stdin, termios.TCSADRAIN, attributes)
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+
+def steamcmd_environment() -> dict[str, str]:
+    result = clean_steam_environment()
+    result["HOME"] = str(HOME / "steamcmd/home")
+    result["LANG"] = result["LC_ALL"] = "C.UTF-8"
+    pathlib.Path(result["HOME"]).mkdir(parents=True, exist_ok=True, mode=0o700)
+    return result
+
+
+def prepare_steamcmd() -> pathlib.Path:
+    target = HOME / "steamcmd/client"
+    for directory in (target, HOME / "steamcmd/game", HOME / "steamcmd/home"):
+        if not directory.resolve().is_relative_to(HOME.resolve()):
+            raise RuntimeError("SteamCMD data must stay inside persistent HOME; existing data was retained")
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (HOME / "steamcmd").chmod(0o700)
+    # Valve updates its bootstrap in writable persistent storage. The image's
+    # original is immutable; never reuse Windows Steam files or GUI manifests.
+    for source in STEAMCMD_BOOTSTRAP.rglob("*"):
+        relative = source.relative_to(STEAMCMD_BOOTSTRAP)
+        destination = target / relative
+        if source.is_file() and not destination.exists():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+    launcher = target / "steamcmd.sh"
+    if not launcher.is_file():
+        raise RuntimeError("The SteamCMD bootstrap is missing; load the rebuilt image")
+    return launcher
+
+
+def steamcmd_app_info(output: str) -> dict:
+    # Ignore SteamCMD banners/login messages outside the one quoted app object.
+    match = re.search(r'(?m)^\s*"' + STEAM_APP_ID + r'"\s*\{', output)
+    if match is None:
+        raise RuntimeError("SteamCMD did not return FS25 metadata")
+    depth, quoted, escaped = 0, False, False
+    for index in range(output.index("{", match.start()), len(output)):
+        char = output[index]
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return parse_vdf(output[match.start():index + 1])[STEAM_APP_ID]
+    raise RuntimeError("SteamCMD returned incomplete FS25 metadata")
+
+
+def steamcmd_dlc_catalog(info: dict) -> tuple[set[str], dict[str, str]]:
+    ids = {value.strip() for value in info.get("extended", {}).get("listofdlc", "").split(",") if value.strip()}
+    depots = {}
+    for depot, details in info.get("depots", {}).items():
+        if not isinstance(details, dict) or "dlcappid" not in details:
+            continue
+        appid = details["dlcappid"]
+        ids.add(appid)
+        config = details.get("config", {})
+        systems = (config.get("oslist") or "windows").split(",")
+        language = config.get("language") or "english"
+        public = details.get("manifests", {}).get("public", {})
+        if "windows" in systems and (config.get("osarch") or "64") == "64" and language == "english" and public:
+            depots[depot] = appid
+    if any(not re.fullmatch(r"[0-9]{1,10}", appid) for appid in ids):
+        raise RuntimeError("Steam returned an invalid DLC App ID")
+    return ids, depots
+
+
+def steamcmd_owned_dlcs(output: str, requested: set[str]) -> set[str]:
+    absent = set(re.findall(r"No active license found for appID (\d+)\.", output))
+    owned = set()
+    for package in re.split(r"License packageID\s+\d+:", output)[1:]:
+        if not re.search(r"State\s*:\s*Active\b", package):
+            continue
+        for apps in re.findall(r"Apps\s*:\s*(.*?)\(\d+ in total\)", package, re.S):
+            owned.update(re.findall(r"\b\d+\b", apps))
+    if requested - (owned | absent) or requested & owned & absent:
+        raise RuntimeError("SteamCMD did not confirm every DLC entitlement; the game download was not started")
+    return requested & owned
+
+
+def update_steamcmd() -> None:
+    launcher = prepare_steamcmd()
+    account = input("Steam account name (password and Steam Guard are requested by SteamCMD): ").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", account):
+        raise ValueError("Enter a valid Steam account name, not a password or command")
+    environment = steamcmd_environment()
+    directory = HOME / "steamcmd/game"
+    directory.mkdir(parents=True, exist_ok=True)
+    base = [str(launcher), "+@sSteamCmdForcePlatformType", "windows", "+force_install_dir", str(directory), "+login", account]
+
+    def session(arguments):
+        return interactive_process([*base, *arguments, "+quit"], cwd=launcher.parent,
+                                   process_env=environment, capture=True)
+
+    info = steamcmd_app_info(session(["+app_info_update", "1", "+app_info_print", STEAM_APP_ID]))
+    ids, depots = steamcmd_dlc_catalog(info)
+    questions = [item for appid in sorted(ids) for item in ("+licenses_for_app", appid)]
+    owned = steamcmd_owned_dlcs(session(questions), ids) if ids else set()
+    # Entitlements are collected from live stdout, never console_log.txt: that
+    # file omits license responses on the tested client. No hard-coded DLC list.
+    session(["+app_update", STEAM_APP_ID, "validate"])
+    if game_directory() != directory.resolve():
+        raise RuntimeError("SteamCMD updated an unexpected installation")
+    state = read_vdf(directory / "steamapps" / f"appmanifest_{STEAM_APP_ID}.acf")["appstate"]
+    installed = state.get("installeddepots", {})
+    missing = {depot for depot, appid in depots.items() if appid in owned and depot not in installed}
+    if missing:
+        raise RuntimeError("Owned Windows DLC depots are missing: " + ", ".join(sorted(missing)) + ". Finish optional DLC installation before retrying")
+    for depot, appid in depots.items():
+        if appid not in owned:
+            continue
+        public = info["depots"][depot]["manifests"]["public"]
+        expected = public.get("gid") if isinstance(public, dict) else public
+        if not expected or installed[depot].get("manifest") != expected:
+            raise RuntimeError(f"DLC depot {depot} does not match the current public manifest; retry the update")
+    receipt = {"appid": STEAM_APP_ID, "buildid": state.get("buildid"), "owned_dlcs": sorted(owned),
+               "installed_dlcs": sorted({value.get("dlcappid") for value in installed.values() if value.get("dlcappid")})}
+    (HOME / "steamcmd/verified-dlcs.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+    log(f"SteamCMD game validation and owned Windows DLC depot checks passed ({len(owned)} DLC entitlements).")
+
+
+def update() -> None:
+    if not sys.stdin.isatty():
+        raise RuntimeError("Open Update FS25 on the noVNC desktop; interactive login/update confirmation needs a terminal")
+    with activity_lock(exclusive=True):
+        # Refuse before stopping anything if an active game needs saving.
+        if game_server_running():
+            raise MaintenanceBusy("Save and stop the game in GIANTS first, then click Update FS25 again")
+        if matching_processes(INSTALLER_PROCESS_PATTERN):
+            raise MaintenanceBusy("Finish or close the running installer before updating")
+        stop_owned_webserver()
+        if installation_source() == "steam":
+            stop_update_clients()
+        require_update_idle()
+        marker = HOME / ".fs25-update-incomplete"
+        marker.touch()
+        if installation_source() == "steam" and steam_download_mode() == "steamcmd":
+            update_steamcmd()
+        else:
+            if installation_source() == "steam":
+                prepare()
+                command, cwd, environment = steam_launch_context()
+                with (LOG_DIR / "steam-launch.log").open("a", encoding="utf-8") as output:
+                    subprocess.Popen([*command, f"steam://validate/{STEAM_APP_ID}"], cwd=cwd, env=environment,
+                                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+                log("Finish FS25/DLC downloads in Steam, then use Steam > Exit. The update lease stays held while you work.")
+            else:
+                directory = game_directory()
+                executable = directory / "FarmingSimulator2025.exe"
+                if not executable.is_file():
+                    raise RuntimeError("Install FS25 before using its official updater")
+                log("The official GIANTS launcher checks for updates. Complete its updater, then close the game.")
+                interactive_process(["wine", str(executable)], cwd=directory)
+            if input("After the official updater finishes successfully and you have closed it, type UPDATED: ").strip() != "UPDATED":
+                raise RuntimeError("Update was not confirmed; server startup remains blocked until you retry Update FS25")
+        # Do not shut down a newly opened Steam session before acknowledging
+        # the operator's completed downloads. Never force-kill pending work.
+        if installation_source() == "steam" and matching_processes(STEAM_PROCESS_PATTERN):
+            raise MaintenanceBusy("Close Steam/SteamCMD completely, then retry Update FS25; installation remains blocked")
+        require_update_idle()
+        directory = game_directory()
+        if installation_source() == "steam":
+            ensure_steam_appid(directory)
+        elif not all((directory / name).is_file() for name in ("FarmingSimulator2025.exe", "dedicatedServer.exe")):
+            raise RuntimeError("The updated GIANTS installation is incomplete")
+        configure()
+        patch_web()
+        marker.unlink()
+        log("Update session completed and installation checks passed. The server stays stopped. Start Steam (Steam mode) and the FS25 web server when ready.")
+
+
 @contextlib.contextmanager
 def server_start_lock():
     """Serialize panel/desktop starts and hold ownership for the server lifetime."""
@@ -1291,12 +1788,138 @@ def server_start_lock():
 def require_server_stopped() -> None:
     if webserver_running():
         raise ServerAlreadyRunning("The FS25 web server is already running; use the existing GIANTS Web Interface")
-    if installation_source() == "steam" and game_server_running():
+    if game_server_running():
         raise ServerAlreadyRunning("An FS25 game process is already running; close it before starting another server")
 
 
+def process_start_time(pid: int) -> str:
+    # /proc stat's comm can itself contain spaces and parentheses.
+    return (PROC_DIR / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19]
+
+
+def server_owner() -> int | None:
+    path = HOME / ".fs25-webserver.json"
+    if not path.exists():
+        return None
+    try:
+        state = json.loads(path.read_text())
+        pid = state["pid"]
+        if type(pid) is not int or pid <= 1 or pid == os.getpid():
+            raise ValueError("Invalid web server owner")
+        proc = PROC_DIR / str(pid)
+        if not proc.exists():
+            return None
+        if proc.stat().st_uid != os.getuid() or process_start_time(pid) != state["start_time"]:
+            return None  # stale PID file; never signal a reused PID
+        arguments = (proc / "cmdline").read_bytes().decode().split("\0")
+        if "start-webserver" not in arguments or not any(pathlib.PurePosixPath(arg).name == "fs25ctl.py" for arg in arguments):
+            raise ValueError("Web server owner is not the managed controller")
+        return pid
+    except FileNotFoundError:
+        return None  # owner exited during the /proc read
+    except (KeyError, ValueError, OSError, TypeError, IndexError) as exc:
+        raise MaintenanceBusy(f"Could not verify the web server owner: {exc}") from exc
+
+
+def stop_owned_webserver(*, allow_game: bool = False) -> None:
+    if not allow_game and game_server_running():
+        raise MaintenanceBusy("Save and stop the game in the GIANTS Web Interface first; no game process was killed")
+    (HOME / ".fs25-start-cancelled").touch()
+    pid = server_owner()
+    if pid is not None:
+        # pidfd ties delivery to this exact process even if it exits/reuses its
+        # numeric PID between validation and signal delivery (Linux >= 5.3).
+        if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+            try:
+                descriptor = os.pidfd_open(pid)
+            except ProcessLookupError:
+                descriptor = None
+            if descriptor is not None:
+                try:
+                    if server_owner() == pid:
+                        try:
+                            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                finally:
+                    os.close(descriptor)
+        else:
+            if server_owner() == pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+    deadline = time.monotonic() + 20
+    while webserver_running() or server_owner() is not None:
+        if pid is None or time.monotonic() >= deadline:
+            raise MaintenanceBusy("The web server has not stopped; close its original controller before updating")
+        time.sleep(0.2)
+
+
+def stop_server() -> None:
+    with activity_lock(exclusive=True):
+        stop_owned_webserver()
+        log("FS25 web server stopped. The desktop stays online; nothing will restart until you request it.")
+
+
+def run_server_process(command: list[str], cwd: pathlib.Path, process_env: dict[str, str] | None,
+                       release_startup) -> int:
+    state_path = HOME / ".fs25-webserver.json"
+    process = None
+    previous = {}
+
+    def stop(_signum, _frame):
+        if process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            raise SystemExit(143)
+
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            previous[sig] = signal.signal(sig, stop)
+        process = subprocess.Popen(command, cwd=cwd, env=process_env,
+                                   stdin=subprocess.DEVNULL, start_new_session=True)
+        state_path.write_text(json.dumps({"pid": os.getpid(), "start_time": process_start_time(os.getpid())}), encoding="utf-8")
+        release_startup()
+        status = process.wait()
+        return status if status >= 0 else 128 - status
+    finally:
+        try:
+            if process is not None and process.poll() is None:
+                stop(signal.SIGTERM, None)
+                try:
+                    process.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+        finally:
+            state_path.unlink(missing_ok=True)
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+
+def launch_webserver() -> None:
+    """A desktop terminal is a log viewer, never the service's parent session."""
+    with activity_lock():
+        require_update_complete()
+        ensure_directories()
+        if not webserver_running() and server_owner() is None:
+            with (LOG_DIR / "dedicated-server.log").open("a", encoding="utf-8") as output:
+                subprocess.Popen([sys.executable, str(pathlib.Path(__file__).resolve()), "start-webserver"],
+                                 stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                                 start_new_session=True, close_fds=True)
+    log("Closing this log window does not stop FS25 or noVNC. Use Stop FS25 web server to stop the service.")
+    subprocess.run(["tail", "-n", "60", "-F", str(LOG_DIR / "dedicated-server.log")], check=False)
+
+
 def start_webserver() -> int:
-    with server_start_lock():
+    with server_start_lock(), contextlib.ExitStack() as startup:
+        startup.enter_context(activity_lock())
+        require_update_complete()
         # Check before prepare() as it can rewrite GIANTS configuration and links.
         require_server_stopped()
         prepare()
@@ -1312,7 +1935,7 @@ def start_webserver() -> int:
             # Readiness probing must not relink Documents while a user starts
             # the normal game. Link data only during the locked server start.
             require_server_stopped()
-            _, process_env = proton_launch_context(directory, [str(executable)])
+            _, process_env = steam_game_launch_context(directory, [str(executable)])
             prepare_proton_config(process_env)
         configure()
         patch_web()
@@ -1324,23 +1947,25 @@ def start_webserver() -> int:
         # The controller retains the lock; an exec'ed Wine loader may close
         # inherited descriptors and accidentally release it before the game exits.
         if installation_source() == "steam":
-            command, process_env = proton_launch_context(directory, [str(executable)])
+            command, process_env = steam_game_launch_context(directory, [str(executable)])
             prepare_proton_config(process_env)
-            log(f"Starting FS25 dedicated server with full Proton: {command[1]}")
-            result = subprocess.run(command, cwd=directory, env=process_env)
+            log(f"Starting FS25 dedicated server with {steam_backend()} Steam runtime.")
         else:
-            result = subprocess.run(["wine", str(executable)], cwd=directory)
-        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+            command, process_env = ["wine", str(executable)], None
+        return run_server_process(command, cwd=directory, process_env=process_env, release_startup=startup.close)
 
 
 def webserver_running() -> bool:
     try:
-        return subprocess.run(
-            ["pgrep", "-u", str(os.getuid()), "-i", "-f", r"(^|[/\\])dedicatedServer\.exe(\s|$)"],
+        result = subprocess.run(
+            ["pgrep", "-u", str(os.getuid()), "-i", "-f", r"(^|[/\\ ])dedicatedServer\.exe(\s|$)"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-        ).returncode == 0
-    except OSError:
-        return False
+        )
+        if result.returncode not in {0, 1}:
+            raise RuntimeError("Web server process inspection failed")
+        return result.returncode == 0
+    except OSError as exc:
+        raise RuntimeError("Web server process inspection failed") from exc
 
 
 def game_server_running() -> bool:
@@ -1352,12 +1977,17 @@ def game_server_running() -> bool:
             stderr=subprocess.DEVNULL,
             check=False,
         )
+        if result.returncode not in {0, 1}:
+            raise RuntimeError("Game process inspection failed")
         return result.returncode == 0
-    except OSError:
-        return False
+    except OSError as exc:
+        raise RuntimeError("Game process inspection failed") from exc
 
 
 def autostart_game() -> None:
+    if (HOME / ".fs25-start-cancelled").exists():
+        log("Automatic game startup was cancelled by stop/update.")
+        return
     if game_server_running():
         log("The game server is already running; the automatic start request was skipped.")
         return
@@ -1371,6 +2001,8 @@ def autostart_game() -> None:
         pass
     base = ""
     for _ in range(60):
+        if (HOME / ".fs25-start-cancelled").exists():
+            return
         for host in hosts:
             candidate = f"http://{host}:{port}/index.html?lang=en"
             try:
@@ -1418,9 +2050,13 @@ def autostart_game() -> None:
     if game_server_running():
         log("The game server started while the Web Interface was loading; no second start request was sent.")
         return
-    params["start_server"] = "Start"
-    with opener.open(base, urllib.parse.urlencode(params).encode(), timeout=30) as response:
-        response.read()
+    with activity_lock():
+        require_update_complete()
+        if (HOME / ".fs25-start-cancelled").exists():
+            return
+        params["start_server"] = "Start"
+        with opener.open(base, urllib.parse.urlencode(params).encode(), timeout=30) as response:
+            response.read()
     log("The game server was started through the GIANTS Web Interface.")
 
 
@@ -1585,7 +2221,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "command",
-        choices=("prepare", "configure", "install", "install-dlcs", "steam", "patch-web", "start-webserver", "autostart-game", "diagnose"),
+        choices=("prepare", "configure", "install", "install-dlcs", "steam", "patch-web", "start-webserver", "launch-webserver", "stop-server", "update", "autostart-game", "diagnose"),
     )
     parser.add_argument("--seconds", type=int, default=5, help="Read-only diagnose sample duration (1-30 seconds).")
     args = parser.parse_args()
@@ -1593,7 +2229,7 @@ def main() -> int:
         if args.command == "diagnose":
             diagnose(args.seconds)
             return 0
-        result = {
+        actions = {
             "prepare": prepare,
             "configure": configure,
             "install": install,
@@ -1601,12 +2237,29 @@ def main() -> int:
             "steam": open_steam,
             "patch-web": patch_web,
             "start-webserver": start_webserver,
+            "launch-webserver": launch_webserver,
+            "stop-server": stop_server,
+            "update": update,
             "autostart-game": autostart_game,
-        }[args.command]()
+        }
+        if args.command in {"prepare", "configure", "patch-web"} or (
+            args.command in {"install", "install-dlcs"} and installation_source() == "giants"
+        ):
+            # Legacy commands remain available, but cannot mutate installation
+            # files while an update holds the exclusive lease.
+            with activity_lock(exclusive=True):
+                if args.command in {"install", "install-dlcs"}:
+                    require_server_stopped()
+                result = actions[args.command]()
+        else:
+            result = actions[args.command]()
         return result if isinstance(result, int) else 0
-    except (SteamNotReady, ServerAlreadyRunning) as exc:
+    except (SteamNotReady, ServerAlreadyRunning, MaintenanceBusy) as exc:
         log(f"PENDING: {exc}")
         return 75
+    except (KeyboardInterrupt, EOFError):
+        log("Operation cancelled. An unfinished update must be retried before starting the server.")
+        return 130
     except Exception as exc:
         log(f"ERROR: {exc}")
         return 1

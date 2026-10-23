@@ -1,5 +1,6 @@
 /* Probe the installed game's Steam API without launching the game or logging in.
- * This executable runs under FS25's full Proton and bridges to native Linux Steam.
+ * Run under the selected game's Wine/Proton runtime with its real Steam API.
+ * SteamCMD download/login alone is not proof of an active game-client session.
  * Copyright (c) 2026 Eric (DasEric). MIT, see LICENSE.
  */
 #define WIN32_LEAN_AND_MEAN

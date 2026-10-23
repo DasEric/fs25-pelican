@@ -4,10 +4,10 @@
     "version": "PTDL_v2",
     "update_url": "https://raw.githubusercontent.com/DasEric/fs25-pelican/main/egg-farming-simulator-25.json"
   },
-  "exported_at": "2026-10-07T00:00:00+02:00",
+  "exported_at": "2026-10-24T00:00:00+02:00",
   "name": "Farming Simulator 25",
   "author": "DasEric@users.noreply.github.com",
-  "description": "Farming Simulator 25 dedicated server with GIANTS installer or native Linux Steam and full Proton. Steam login and Steam Guard are completed in noVNC; the session, game, DLCs and server data persist.",
+  "description": "Farming Simulator 25 dedicated server with GIANTS installer or the normal Steam client. Steam login and Steam Guard are completed in noVNC; the session, game, DLCs and server data persist.",
   "features": null,
   "tags": [
     "farming-simulator",
@@ -35,8 +35,18 @@
   },
   "variables": [
     {
+      "name": "Steam download mode",
+      "description": "client keeps the normal Steam library. steamcmd uses a separate Windows game download in /home/container/steamcmd/game; open Install or Update FS25 for terminal login/Steam Guard and owned-DLC validation. This changes the downloader, not the required Steam runtime. Existing libraries are retained. SteamCMD server operation still needs live-node verification.",
+      "env_variable": "STEAM_DOWNLOAD_MODE",
+      "default_value": "client",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:client,steamcmd",
+      "field_type": "text"
+    },
+    {
       "name": "Installation source",
-      "description": "giants uses an uploaded GIANTS installer; steam opens native Linux Steam. Sign in and complete Steam Guard through noVNC. Select Proton 11 in FS25 Properties > Compatibility, install FS25/DLCs, run the game once and close it, then restart. Keep Steam running and Remember me enabled.",
+      "description": "giants uses an uploaded GIANTS installer; steam opens the normal Windows Steam client in the container. Sign in and complete Steam Guard through noVNC, install FS25/DLCs, finish first-run setup and close the game, then restart. Keep Steam running and Remember me enabled. No host namespace changes are needed for the default backend.",
       "env_variable": "INSTALL_SOURCE",
       "default_value": "giants",
       "user_viewable": true,
@@ -246,7 +256,7 @@
     },
     {
       "name": "Autostart",
-      "description": "false keeps only the desktop online; web_only starts the GIANTS web interface; true also starts the game server.",
+      "description": "Applied once per container start: false keeps only the desktop online; web_only starts the GIANTS web interface; true also starts the game server. Closing a log window or reconnecting noVNC does not restart the server.",
       "env_variable": "AUTOSTART_SERVER",
       "default_value": "web_only",
       "user_viewable": true,

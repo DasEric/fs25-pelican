@@ -100,7 +100,7 @@ def spawn(
             if log_name == "steam-launch.log":
                 steam_env = process_env if process_env is not None else os.environ
                 target.write(f"[FS25] {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} Launch: {shlex.join(args)}\n")
-                target.write(f"[FS25] backend=native-linux; HOME={steam_env.get('HOME')}; DISPLAY={steam_env.get('DISPLAY')}; "
+                target.write(f"[FS25] backend={'windows-wine' if steam_env.get('WINEPREFIX') else 'native-linux'}; HOME={steam_env.get('HOME')}; DISPLAY={steam_env.get('DISPLAY')}; "
                              f"cwd={cwd}; WINEDEBUG={steam_env.get('WINEDEBUG')}; "
                              f"PROTON_DISABLE_LSTEAMCLIENT={steam_env.get('PROTON_DISABLE_LSTEAMCLIENT')}; "
                              f"WINEFSYNC={steam_env.get('WINEFSYNC')}; PROTON_NO_NTSYNC={steam_env.get('PROTON_NO_NTSYNC')}\n")
@@ -147,6 +147,15 @@ def stop_children(signum: int = signal.SIGTERM) -> None:
     stopping = True
     # Keep Steam and the desktop available while the supervised FS25 processes stop.
     stop_processes(server_children, signum)
+    # Desktop-launched controllers use their own session and are not children
+    # in server_children. Stop only the verified owner, never all Wine/XFCE.
+    if (HOME / ".fs25-webserver.json").is_file():
+        from fs25ctl import stop_owned_webserver
+
+        try:
+            stop_owned_webserver(allow_game=True)
+        except (OSError, RuntimeError) as exc:
+            log(f"Desktop server shutdown: {exc}")
     if steam_started:
         from fs25ctl import shutdown_steam
 
@@ -251,7 +260,7 @@ def startup_command() -> list[str]:
 
 
 def wait_for_steam_session(xvnc: subprocess.Popen, timeout: int = 180) -> bool:
-    from fs25ctl import SteamNotReady, ensure_steam_appid, game_directory, steam_session_ready
+    from fs25ctl import SteamNotReady, activity_lock, ensure_steam_appid, game_directory, require_update_complete, steam_session_ready
 
     log("Waiting for Steam. Complete login / Steam Guard in noVNC if Steam asks for it.")
     deadline = time.monotonic() + timeout
@@ -261,11 +270,13 @@ def wait_for_steam_session(xvnc: subprocess.Popen, timeout: int = 180) -> bool:
         if remaining <= 0:
             break
         try:
-            directory = game_directory()
-            ensure_steam_appid(directory)
-            if steam_session_ready(directory, timeout=remaining) and time.monotonic() < deadline:
-                log("Steam session ready (confirmed by FS25's Steam API).")
-                return True
+            with activity_lock():
+                require_update_complete()
+                directory = game_directory()
+                ensure_steam_appid(directory)
+                if steam_session_ready(directory, timeout=remaining) and time.monotonic() < deadline:
+                    log("Steam session ready (confirmed by FS25's Steam API).")
+                    return True
             message = "Steam login is pending. Open Steam in noVNC; the client must stay running."
         except SteamNotReady as exc:
             message = str(exc)
@@ -300,8 +311,8 @@ def main() -> int:
     # Apply these in the parent before Wine starts so the GIANTS game child
     # inherits them, including when an existing prefix skips registry setup.
     from fs25ctl import (
-        SteamNotReady, configure_runtime, configure_terminal, game_directory, game_server_running,
-        installation_source, steam_launch_context, webserver_running,
+        SteamNotReady, activity_lock, configure_runtime, configure_terminal, game_directory, game_server_running,
+        installation_source, require_update_complete, steam_launch_context, webserver_running,
     )
 
     source = installation_source()
@@ -311,6 +322,9 @@ def main() -> int:
     configure_runtime()
     configure_terminal()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # Only an actual container boot resets manual-stop intent, never a desktop
+    # click/reconnect. Old autostart helpers cannot be rearmed by a manual start.
+    (HOME / ".fs25-start-cancelled").unlink(missing_ok=True)
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, signal_handler)
 
@@ -318,12 +332,22 @@ def main() -> int:
     novnc_port = os.environ.get("NOVNC_PORT", "6080")
     spawn(["websockify", "--web", find_novnc_webroot(), novnc_port, "localhost:5900"], "novnc.log")
     start_desktop()
-    subprocess.run([CONTROL, "prepare"], check=True)
+    setup_error = None
+    try:
+        subprocess.run([CONTROL, "prepare"], check=True)
+    except subprocess.CalledProcessError as exc:
+        if source != "steam" and exc.returncode != 75:
+            raise
+        setup_error = exc
 
     public_host = os.environ.get("PUBLIC_IP") or os.environ.get("SERVER_IP") or "SERVER-IP"
     log_access_addresses(public_host, novnc_port)
     log("FS25 image ready.")
     log("This is container readiness, not confirmation that the game map has finished loading.")
+
+    if setup_error is not None:
+        log(f"FS25 setup exited with status {setup_error.returncode}. noVNC stays available; finish maintenance or check the setup logs, then retry from the desktop.")
+        return xvnc.wait()
 
     if source == "steam":
         log("Steam mode: sign in and complete Steam Guard in the Steam client through noVNC.")
@@ -337,11 +361,13 @@ def main() -> int:
         # First setup and desktop-only mode need the login/library window,
         # not a hidden client. Background mode is only for installed autostarts.
         try:
-            steam_args, steam_cwd, steam_env = steam_launch_context(silent=mode != "false" and directory is not None)
-            spawn(steam_args, "steam-launch.log", cwd=steam_cwd, process_env=steam_env)
-            steam_started = True
+            with activity_lock():
+                require_update_complete()
+                steam_args, steam_cwd, steam_env = steam_launch_context(silent=mode != "false" and directory is not None)
+                spawn(steam_args, "steam-launch.log", cwd=steam_cwd, process_env=steam_env)
+                steam_started = True
         except (OSError, RuntimeError) as exc:
-            log(f"Native Steam launch failed: {exc}; check logs/steam-launch.log. noVNC stays available.")
+            log(f"Steam launch failed: {exc}; check logs/steam-launch.log. noVNC stays available.")
             return xvnc.wait()
         if pending is not None:
             log(pending)
@@ -389,17 +415,22 @@ def main() -> int:
         arg.replace("\\", "/").rsplit("/", 1)[-1].lower() == "dedicatedserver.exe"
         for arg in command
     )
-    server = spawn(command, "dedicated-server.log", cwd=directory if game_command else None)
-    if mode == "true":
-        spawn([CONTROL, "autostart-game"], "autostart-game.log")
-    status = server.wait()
-    if source == "steam" and status != 0:
-        # A download, expired login or a competing desktop start can happen
-        # after the first check. Keep noVNC instead of tearing down the container.
-        log(f"FS25 startup exited with status {status}. Check noVNC and logs/dedicated-server.log, then retry.")
-        stop_processes([process for process in server_children if process is not server], signal.SIGTERM)
+    try:
+        with activity_lock():
+            require_update_complete()
+            server = spawn(command, "dedicated-server.log", cwd=directory if game_command else None)
+            if mode == "true":
+                spawn([CONTROL, "autostart-game"], "autostart-game.log")
+    except RuntimeError as exc:
+        log(f"FS25 startup deferred: {exc}. noVNC stays available.")
         return xvnc.wait()
-    return status
+    status = server.wait()
+    # The desktop is the container's lifetime service, not dedicatedServer.exe.
+    # In particular a normal web-panel exit (status 0) must not restart the
+    # container and replay AUTOSTART_SERVER. Reconnecting noVNC does nothing here.
+    log(f"FS25 web server exited with status {status}. noVNC stays online; restart the web server from the desktop when needed.")
+    stop_processes([process for process in server_children if process is not server], signal.SIGTERM)
+    return xvnc.wait()
 
 
 if __name__ == "__main__":

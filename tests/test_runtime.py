@@ -68,13 +68,18 @@ class RuntimeFixture(unittest.TestCase):
         ) if hasattr(entry, "steam_started") else mock.patch.multiple(entry, HOME=self.home, LOG_DIR=self.home / "logs", INSTALLER_DIR=self.home / "installer")
         entry_patcher.start()
         self.addCleanup(entry_patcher.stop)
-        environment = mock.patch.dict(os.environ, {"USER": "container"}, clear=True)
+        # Existing native-backend regressions remain explicit. Production uses
+        # Windows Steam by default; WindowsSteamIntegrationTests cover that path.
+        environment = mock.patch.dict(os.environ, {"USER": "container", "FS25_STEAM_BACKEND": "linux"}, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
         if os.name == "nt" and hasattr(ctl, "server_start_lock"):
             lock = mock.patch.object(ctl, "server_start_lock", side_effect=contextlib.nullcontext)
             lock.start()
             self.addCleanup(lock.stop)
+            maintenance = mock.patch.object(ctl, "activity_lock", side_effect=lambda **kwargs: contextlib.nullcontext())
+            maintenance.start()
+            self.addCleanup(maintenance.stop)
         output = contextlib.redirect_stdout(io.StringIO())
         output.__enter__()
         self.addCleanup(output.__exit__, None, None, None)
@@ -523,11 +528,13 @@ class SteamGuiLaunchTests(RuntimeFixture):
     def test_desktop_launch_passes_same_directory_and_environment(self):
         self.client_fixture()
         with mock.patch.object(ctl, "prepare"), mock.patch.object(ctl.os, "chdir") as chdir, \
-                mock.patch.object(ctl.os, "execvpe") as execute:
+                mock.patch.object(ctl.subprocess, "Popen") as execute:
             ctl.open_steam()
-        chdir.assert_called_once_with(self.home)
-        self.assertIn("-cef-disable-gpu", execute.call_args.args[1])
-        self.assertNotIn("WINEDEBUG", execute.call_args.args[2])
+        chdir.assert_not_called()
+        self.assertEqual(execute.call_args.kwargs["cwd"], self.home)
+        self.assertIn("-cef-disable-gpu", execute.call_args.args[0])
+        self.assertNotIn("WINEDEBUG", execute.call_args.kwargs["env"])
+        self.assertTrue(execute.call_args.kwargs["start_new_session"])
 
     def test_launch_context_uses_the_selected_command_even_if_installation_changes(self):
         with mock.patch.object(ctl, "steam_executable", side_effect=[ctl.STEAM_LAUNCHER, None]) as check:
@@ -649,7 +656,7 @@ class EntrypointTests(RuntimeFixture):
             if source == "steam":
                 self.steam_install()
             else:
-                self.game.mkdir(parents=True)
+                self.game.mkdir(parents=True, exist_ok=True)
                 (self.game / "dedicatedServer.exe").touch()
         desktop = mock.Mock()
         desktop.wait.return_value = 0
@@ -735,7 +742,7 @@ class DesktopServerTests(RuntimeFixture):
         stack.enter_context(mock.patch.object(ctl, "webserver_running", return_value=web))
         stack.enter_context(mock.patch.object(ctl, "game_server_running", return_value=game))
         chdir = stack.enter_context(mock.patch.object(ctl.os, "chdir"))
-        execute = stack.enter_context(mock.patch.object(ctl.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)))
+        execute = stack.enter_context(mock.patch.object(ctl, "run_server_process", return_value=0))
         return directory, chdir, execute
 
     def test_pending_session_prevents_desktop_server_start(self):
@@ -763,7 +770,7 @@ class DesktopServerTests(RuntimeFixture):
         self.assertEqual(execute.call_args.args[0][2:], ["run", str(directory.resolve() / "dedicatedServer.exe")])
         self.assertTrue(execute.call_args.args[0][1].endswith("proton"))
         self.assertEqual(execute.call_args.kwargs["cwd"], directory.resolve())
-        self.assertEqual(execute.call_args.kwargs["env"]["PROTON_DISABLE_LSTEAMCLIENT"], "0")
+        self.assertEqual(execute.call_args.kwargs["process_env"]["PROTON_DISABLE_LSTEAMCLIENT"], "0")
         self.assertEqual((directory / "steam_appid.txt").read_bytes(), b"2300320\n")
         self.assertTrue((directory / "dedicatedServer.xml").is_file())
 
@@ -1035,7 +1042,128 @@ class LinuxSteamIntegrationTests(RuntimeFixture):
         self.assertIn("test -x /usr/bin/steam", source)
         self.assertIn("/tmp/steam-libs-amd64.deb /tmp/steam-libs-i386.deb", source)
         self.assertIn("rm -f /etc/apt/sources.list.d/steam-stable.list", source)
-        self.assertNotIn("SteamSetup.exe", source)
+        self.assertIn("SteamSetup.exe", source)  # Windows is the namespace-free default.
+
+
+class WindowsSteamIntegrationTests(RuntimeFixture):
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("FS25_STEAM_BACKEND")
+        os.environ["INSTALL_SOURCE"] = "steam"
+        self.steam_prefix = self.home / ".fs25steam"
+        self.steam_wine = self.home / "wine-staging"
+        paths = mock.patch.multiple(ctl, STEAM_WINDOWS_PREFIX=self.steam_prefix,
+                                    STEAM_WINDOWS_DIR=self.library, STEAM_WINE_DIR=self.steam_wine,
+                                    STEAM_SETUP=self.home / "SteamSetup.exe")
+        paths.start()
+        self.addCleanup(paths.stop)
+        for name in ("wine", "wineserver", "winepath", "wineboot"):
+            path = self.steam_wine / "bin" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"runtime fixture")
+        self.library.mkdir(parents=True)
+        (self.library / "steam.exe").write_bytes(b"client fixture")
+
+    def test_default_does_not_require_native_namespaces(self):
+        self.assertEqual(ctl.steam_backend(), "windows")
+        self.assertEqual(ctl.steam_executable(), self.library / "steam.exe")
+        with mock.patch.dict(os.environ, {"FS25_STEAM_BACKEND": "invalid"}):
+            with self.assertRaises(ValueError):
+                ctl.steam_backend()
+
+    def test_prefix_runtime_and_client_are_separate_from_giants_and_native(self):
+        os.environ.update({"WINEPREFIX": str(self.prefix), "WINESERVER": "/old/wineserver",
+                           "WINEDLLOVERRIDES": "dwrite=d", "LD_LIBRARY_PATH": "/old/lib",
+                           "PROTON_DISABLE_LSTEAMCLIENT": "1", "SteamAppId": "wrong",
+                           "DISPLAY": ":0", "DBUS_SESSION_BUS_ADDRESS": "desktop-bus"})
+        before = dict(os.environ)
+        command, cwd, environment = ctl.steam_launch_context()
+        self.assertIn(str(self.steam_wine / "bin/wine"), command)
+        self.assertIn(str(self.library / "steam.exe"), command)
+        self.assertEqual(cwd, self.library)
+        self.assertEqual(environment["WINEPREFIX"], str(self.steam_prefix))
+        self.assertEqual(environment["WINESERVER"], str(self.steam_wine / "bin/wineserver"))
+        self.assertEqual(environment["WINEDLLOVERRIDES"], "mscoree=d")
+        self.assertEqual(environment["DBUS_SESSION_BUS_ADDRESS"], "desktop-bus")
+        for name in ("LD_LIBRARY_PATH", "PROTON_DISABLE_LSTEAMCLIENT", "SteamAppId"):
+            self.assertNotIn(name, environment)
+        self.assertEqual(dict(os.environ), before)
+        self.assertNotIn("-no-cef-sandbox", command)
+
+    def test_client_affinity_uses_actual_allowed_cpu_ids(self):
+        with mock.patch.object(ctl.os, "sched_getaffinity", return_value={7, 9, 11}, create=True):
+            self.assertEqual(ctl.steam_client_affinity(), ["/usr/bin/taskset", "-c", "7,9"])
+        with mock.patch.object(ctl.os, "sched_getaffinity", return_value={12}, create=True):
+            self.assertEqual(ctl.steam_client_affinity()[-1], "12")
+
+    def test_api_and_game_share_runtime_prefix_and_app_id(self):
+        directory = self.steam_install()
+        helper = self.home / "probe.exe"
+        helper.touch()
+        results = [subprocess.CompletedProcess([], 0, r"C:\Steam\game\steam_api64.dll", ""),
+                   subprocess.CompletedProcess([], 0, "STEAM_SESSION_READY\n", "")]
+        with mock.patch.object(ctl, "STEAM_SESSION_HELPER", helper), \
+                mock.patch.object(ctl.subprocess, "run", side_effect=results) as run:
+            self.assertTrue(ctl.steam_session_ready(directory))
+        conversion, probe = run.call_args_list
+        self.assertEqual(conversion.args[0][0], str(self.steam_wine / "bin/winepath"))
+        self.assertEqual(probe.args[0][0], str(self.steam_wine / "bin/wine"))
+        self.assertEqual(conversion.kwargs["env"], probe.kwargs["env"])
+        game_command, game_env = ctl.steam_game_launch_context(directory, ["server.exe"])
+        self.assertEqual(game_command, [str(self.steam_wine / "bin/wine"), "server.exe"])
+        self.assertEqual(game_env, probe.kwargs["env"])
+        self.assertEqual(game_env["SteamAppId"], "2300320")
+        self.assertNotIn("taskset", game_command)  # Server retains its CPU allowance.
+
+    def test_windows_library_translation_and_external_path_rejection(self):
+        with mock.patch.object(pathlib.Path, "resolve", autospec=True, side_effect=lambda path: path):
+            self.assertEqual(ctl.persistent_library_path(r"C:\Steam"), self.steam_prefix / "drive_c/Steam")
+        if os.name != "nt":
+            # The production Wine Z: mapping is a POSIX root, not the Windows
+            # host drive used to execute this repository's unit tests.
+            with mock.patch.object(ctl, "HOME", pathlib.Path("/home/container")):
+                self.assertEqual(ctl.persistent_library_path(r"Z:\home\container\SteamLibrary"),
+                                 pathlib.Path("/home/container/SteamLibrary").resolve())
+        for value in (r"C:\..\..\outside", r"\\host\share", "relative", "Z:\\outside"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ctl.persistent_library_path(value)
+
+    def test_windows_documents_preserve_existing_server_settings(self):
+        _, environment = ctl.steam_game_launch_context(self.library, [])
+        target = self.steam_prefix / "drive_c/users/container/Documents/My Games/FarmingSimulator2025"
+        target.mkdir(parents=True)
+        (target / "game.xml").write_bytes(b"game defaults")
+        self.config.mkdir(parents=True)
+        (self.config / "game.xml").write_bytes(b"server settings")
+        with mock.patch.object(pathlib.Path, "symlink_to") as link:
+            ctl.prepare_proton_config(environment)
+        link.assert_called_once_with(self.config, target_is_directory=True)
+        self.assertEqual((self.config / "game.xml").read_bytes(), b"server settings")
+        self.assertEqual((target.with_name(target.name + ".before-fs25-link") / "game.xml").read_bytes(), b"game defaults")
+
+    def test_existing_client_shutdown_uses_the_same_wine_prefix(self):
+        with mock.patch.object(ctl.subprocess, "run") as run:
+            ctl.shutdown_steam()
+        self.assertEqual(run.call_args.args[0][-1], "-shutdown")
+        self.assertEqual(run.call_args.kwargs["env"]["WINEPREFIX"], str(self.steam_prefix))
+        self.assertEqual(run.call_args.kwargs["cwd"], self.library)
+
+    def test_prepare_dispatches_to_windows_bootstrap_not_giants(self):
+        with mock.patch.multiple(ctl, prepare_windows_steam=mock.DEFAULT, ensure_prefix=mock.DEFAULT,
+                                 configure_runtime=mock.DEFAULT, create_desktop_shortcuts=mock.DEFAULT) as functions:
+            ctl.prepare()
+        functions["prepare_windows_steam"].assert_called_once_with()
+        functions["ensure_prefix"].assert_not_called()
+
+    def test_image_pins_the_tested_wine_and_keeps_cef_sandbox(self):
+        docker = (SOURCE / "Dockerfile").read_text()
+        self.assertIn("wine-staging-amd64_11.19~trixie-1_amd64.deb", docker)
+        self.assertIn("wine-staging-i386_11.19~trixie-1_i386.deb", docker)
+        self.assertIn("a09a949df1b1e297639aa14fb10c43e3c4e66e933f45617e7b9c1ae1e2ae0ded", docker)
+        self.assertIn("6996249688cbb0e52bf62171eadb1bd42f90cd036f22208ee22c675d43de3d2a", docker)
+        self.assertIn("FS25_STEAM_BACKEND=windows", docker)
+        self.assertIn("fs25-steam-wine-smoke", docker)
+        self.assertNotIn("-no-cef-sandbox", docker)
 
 
 class DockerSmokeOwnershipTests(unittest.TestCase):
@@ -1047,13 +1175,17 @@ class DockerSmokeOwnershipTests(unittest.TestCase):
 
     def test_smoke_prefix_is_created_by_container_before_wineboot(self):
         instructions = self.docker_instructions()
-        smoke = next(line for line in instructions if line.startswith("RUN ") and "wineboot --init" in line)
-        tokens = shlex.split(smoke)
-        self.assertEqual(tokens[:6], ["RUN", "mkdir", "-m", "0700", "/tmp/fs25-wine-smoke", "&&"])
-        self.assertIn("WINEPREFIX=/tmp/fs25-wine-smoke", tokens[6:])
-        position = instructions.index(smoke)
-        user = next(line for line in reversed(instructions[:position]) if line.startswith("USER "))
-        self.assertEqual(user.split(), ["USER", "container"])
+        smokes = [line for line in instructions if line.startswith("RUN ") and "wineboot --init" in line]
+        self.assertEqual(len(smokes), 2)
+        for smoke in smokes:
+            tokens = shlex.split(smoke)
+            prefix = tokens[4]
+            self.assertIn(prefix, {"/tmp/fs25-wine-smoke", "/tmp/fs25-steam-wine-smoke"})
+            self.assertEqual(tokens[:6], ["RUN", "mkdir", "-m", "0700", prefix, "&&"])
+            self.assertIn(f"WINEPREFIX={prefix}", tokens[6:])
+            position = instructions.index(smoke)
+            user = next(line for line in reversed(instructions[:position]) if line.startswith("USER "))
+            self.assertEqual(user.split(), ["USER", "container"])
 
     def test_smoke_dlls_are_owned_by_container_for_tmp_cleanup(self):
         instructions = self.docker_instructions()
@@ -1148,7 +1280,7 @@ class StartupRecoveryTests(RuntimeFixture):
 
         def running(*args, **kwargs):
             self.assertEqual(owned, [True])
-            return subprocess.CompletedProcess([], 0)
+            return 0
 
         execute.side_effect = running
         with mock.patch.object(ctl, "server_start_lock", side_effect=lock):
@@ -1156,9 +1288,13 @@ class StartupRecoveryTests(RuntimeFixture):
         self.assertEqual(owned, [])
 
     def test_server_signal_exit_status_is_normalized(self):
-        directory, chdir, execute = DesktopServerTests.start_fixture(self)
-        execute.return_value.returncode = -15
-        self.assertEqual(ctl.start_webserver(), 143)
+        process = mock.Mock()
+        process.wait.return_value = process.poll.return_value = -15
+        if not hasattr(signal, "SIGHUP"):
+            self.enterContext(mock.patch.object(signal, "SIGHUP", 1, create=True))
+        with mock.patch.object(ctl.subprocess, "Popen", return_value=process), \
+                mock.patch.object(ctl.signal, "signal"), mock.patch.object(ctl, "process_start_time", return_value="123"):
+            self.assertEqual(ctl.run_server_process(["server"], self.home, None, lambda: None), 143)
 
     def test_probe_timeouts_share_the_remaining_wait_budget(self):
         directory = self.session_fixture()
@@ -1318,6 +1454,514 @@ class NativeSteamGuiTests(unittest.TestCase):
                 header = int.from_bytes(data[0x3c:0x40], "little")
                 self.assertEqual(data[header:header + 4], b"PE\0\0")
                 self.assertEqual(int.from_bytes(data[header + 4:header + 6], "little"), expected)
+
+
+class DesktopMaintenanceTests(RuntimeFixture):
+    def test_interrupted_update_suppresses_boot_autostart_but_keeps_vnc(self):
+        run, spawn = EntrypointTests.main_fixture(self, "steam", installed=True)
+        (self.home / ".fs25-update-incomplete").touch()
+        self.assertEqual(entry.main(), 0)
+        logs = [call.args[1] for call in spawn.call_args_list]
+        self.assertNotIn("dedicated-server.log", logs)
+        self.assertNotIn("steam-launch.log", logs)
+
+    def test_manual_start_does_not_rearm_a_cancelled_autostart_helper(self):
+        DesktopServerTests.start_fixture(self)
+        (self.home / ".fs25-start-cancelled").touch()
+        self.assertEqual(ctl.start_webserver(), 0)
+        self.assertTrue((self.home / ".fs25-start-cancelled").exists())
+
+    def test_controller_owns_detached_child_and_records_owner_before_releasing_startup(self):
+        child = mock.Mock(pid=4242)
+        child.poll.return_value = child.wait.return_value = 0
+        if not hasattr(signal, "SIGHUP"):
+            self.enterContext(mock.patch.object(signal, "SIGHUP", 1, create=True))
+        def release():
+            state = json.loads((self.home / ".fs25-webserver.json").read_text())
+            self.assertEqual(state, {"pid": os.getpid(), "start_time": "123"})
+        with mock.patch.object(ctl.subprocess, "Popen", return_value=child) as spawn, \
+                mock.patch.object(ctl.signal, "signal"), mock.patch.object(ctl, "process_start_time", return_value="123"):
+            self.assertEqual(ctl.run_server_process(["wine", "server.exe"], self.home, {}, release), 0)
+        self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+        self.assertEqual(spawn.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertFalse((self.home / ".fs25-webserver.json").exists())
+
+    def test_controller_signal_targets_only_its_owned_group(self):
+        child = mock.Mock(pid=4242)
+        child.poll.return_value = -15
+        handlers = {}
+        if not hasattr(signal, "SIGHUP"):
+            self.enterContext(mock.patch.object(signal, "SIGHUP", 1, create=True))
+        def handler(sig, value):
+            old = handlers.get(sig)
+            handlers[sig] = value
+            return old
+        def wait():
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            return -15
+        child.wait.side_effect = wait
+        with mock.patch.object(ctl.subprocess, "Popen", return_value=child), \
+                mock.patch.object(ctl.signal, "signal", side_effect=handler), \
+                mock.patch.object(ctl.os, "killpg", create=True) as kill, \
+                mock.patch.object(ctl, "process_start_time", return_value="123"):
+            self.assertEqual(ctl.run_server_process(["server"], self.home, None, lambda: None), 143)
+        kill.assert_called_once_with(4242, signal.SIGTERM)
+
+    def test_web_exit_never_ends_desktop_in_either_source(self):
+        for source in ("giants", "steam"):
+            for status in (0, 12, 75, 143):
+                with self.subTest(source=source, status=status):
+                    run, spawn = EntrypointTests.main_fixture(self, source, installed=True)
+                    desktop, server = mock.Mock(), mock.Mock()
+                    desktop.wait.return_value = 37
+                    desktop.poll.return_value = None
+                    server.wait.return_value = status
+                    with mock.patch.object(entry, "start_xvnc", return_value=desktop), \
+                            mock.patch.object(entry, "stop_processes"):
+                        spawn.return_value = server
+                        self.assertEqual(entry.main(), 37)
+                    desktop.wait.assert_called_once_with()
+                    self.assertEqual(sum(call.args[1] == "dedicated-server.log" for call in spawn.call_args_list), 1)
+
+    def test_desktop_buttons_use_managed_actions_not_wine_or_shell(self):
+        ctl.create_desktop_shortcuts()
+        for name, action in (("server", "launch-webserver"), ("stop", "stop-server"), ("update", "update")):
+            text = (ctl.DESKTOP_DIR / f"fs25-{name}.desktop").read_text()
+            self.assertIn(f"/opt/fs25/fs25ctl.py {action}\n", text)
+            self.assertNotIn("bash -c", text)
+            self.assertNotIn("wine ", text)
+
+    def test_launch_detaches_service_and_log_viewer_does_not_own_it(self):
+        with mock.patch.object(ctl, "webserver_running", return_value=False), \
+                mock.patch.object(ctl, "server_owner", return_value=None), \
+                mock.patch.object(ctl.subprocess, "Popen") as spawn, mock.patch.object(ctl.subprocess, "run") as view:
+            ctl.launch_webserver()
+        self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+        self.assertEqual(spawn.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(spawn.call_args.args[0][-1], "start-webserver")
+        self.assertEqual(view.call_args.args[0][:4], ["tail", "-n", "60", "-F"])
+
+    def test_launch_when_running_only_opens_log(self):
+        with mock.patch.object(ctl, "webserver_running", return_value=True), \
+                mock.patch.object(ctl.subprocess, "Popen") as spawn, mock.patch.object(ctl.subprocess, "run"):
+            ctl.launch_webserver()
+        spawn.assert_not_called()
+
+    def test_unfinished_update_blocks_both_start_paths(self):
+        (self.home / ".fs25-update-incomplete").touch()
+        for method in (ctl.launch_webserver, ctl.start_webserver):
+            with self.subTest(method=method.__name__), mock.patch.object(ctl, "prepare") as prepare, \
+                    mock.patch.object(ctl.subprocess, "Popen") as spawn:
+                with self.assertRaises(ctl.MaintenanceBusy):
+                    method()
+                prepare.assert_not_called()
+                spawn.assert_not_called()
+
+    def test_stop_refuses_a_running_game_without_signalling(self):
+        with mock.patch.object(ctl, "game_server_running", return_value=True), \
+                mock.patch.object(ctl.os, "kill") as kill:
+            with self.assertRaises(ctl.MaintenanceBusy):
+                ctl.stop_server()
+        kill.assert_not_called()
+        self.assertFalse((self.home / ".fs25-start-cancelled").exists())
+
+    def test_unmanaged_web_server_is_not_killed(self):
+        with mock.patch.object(ctl, "game_server_running", return_value=False), \
+                mock.patch.object(ctl, "webserver_running", return_value=True), \
+                mock.patch.object(ctl, "server_owner", return_value=None), mock.patch.object(ctl.os, "kill") as kill:
+            with self.assertRaises(ctl.MaintenanceBusy):
+                ctl.stop_server()
+        kill.assert_not_called()
+
+    def test_stop_cancels_pending_autostart(self):
+        with mock.patch.object(ctl, "game_server_running", return_value=False), \
+                mock.patch.object(ctl, "webserver_running", return_value=False):
+            ctl.stop_server()
+        with mock.patch.object(ctl.urllib.request, "urlopen") as request:
+            ctl.autostart_game()
+        request.assert_not_called()
+
+    def test_process_check_failures_are_not_treated_as_stopped(self):
+        with mock.patch.object(ctl.os, "getuid", return_value=999, create=True), \
+                mock.patch.object(ctl.subprocess, "run", return_value=subprocess.CompletedProcess([], 2, "", "failure")):
+            for method in (ctl.webserver_running, ctl.game_server_running, lambda: ctl.matching_processes("steam")):
+                with self.assertRaises(RuntimeError):
+                    method()
+
+    def update_fixture(self, source="steam", mode="steamcmd"):
+        os.environ.update({"INSTALL_SOURCE": source, "STEAM_DOWNLOAD_MODE": mode, "FS25_STEAM_BACKEND": "windows"})
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        for name in ("stop_owned_webserver", "stop_update_clients", "require_update_idle", "configure", "patch_web", "ensure_steam_appid"):
+            stack.enter_context(mock.patch.object(ctl, name))
+        stack.enter_context(mock.patch.object(ctl.sys.stdin, "isatty", return_value=True))
+        stack.enter_context(mock.patch.object(ctl, "game_server_running", return_value=False))
+        stack.enter_context(mock.patch.object(ctl, "matching_processes", return_value=[]))
+        stack.enter_context(mock.patch.object(ctl, "game_directory", return_value=self.game))
+        return stack
+
+    def test_update_refuses_game_before_stopping_anything(self):
+        self.update_fixture()
+        with mock.patch.object(ctl, "game_server_running", return_value=True), \
+                mock.patch.object(ctl, "stop_owned_webserver") as stop, mock.patch.object(ctl, "update_steamcmd") as download:
+            with self.assertRaises(ctl.MaintenanceBusy):
+                ctl.update()
+        stop.assert_not_called()
+        download.assert_not_called()
+        self.assertFalse((self.home / ".fs25-update-incomplete").exists())
+
+    def test_update_refuses_nonterminal_without_changing_state(self):
+        with mock.patch.object(ctl.sys.stdin, "isatty", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "terminal"):
+                ctl.update()
+        self.assertFalse((self.home / ".fs25-update-incomplete").exists())
+
+    def test_update_refuses_installer_before_stopping_server(self):
+        self.update_fixture()
+        with mock.patch.object(ctl, "matching_processes", return_value=[123]), \
+                mock.patch.object(ctl, "stop_owned_webserver") as stop:
+            with self.assertRaises(ctl.MaintenanceBusy):
+                ctl.update()
+        stop.assert_not_called()
+
+    def test_update_orders_shutdown_download_checks_and_never_autostarts(self):
+        self.update_fixture()
+        events = []
+        def download():
+            self.assertTrue((self.home / ".fs25-update-incomplete").exists())
+            events.append("download")
+        with mock.patch.object(ctl, "stop_owned_webserver", side_effect=lambda: events.append("stop-web")), \
+                mock.patch.object(ctl, "stop_update_clients", side_effect=lambda: events.append("stop-steam")), \
+                mock.patch.object(ctl, "update_steamcmd", side_effect=download), \
+                mock.patch.object(ctl, "configure", side_effect=lambda: events.append("configure")), \
+                mock.patch.object(ctl, "start_webserver") as start:
+            ctl.update()
+        self.assertEqual(events, ["stop-web", "stop-steam", "download", "configure"])
+        start.assert_not_called()
+        self.assertFalse((self.home / ".fs25-update-incomplete").exists())
+
+    def test_failed_update_retains_blocker_and_existing_savegame(self):
+        self.update_fixture()
+        save = self.config / "savegame1/careerSavegame.xml"
+        save.parent.mkdir(parents=True)
+        save.write_bytes(b"original save")
+        with mock.patch.object(ctl, "update_steamcmd", side_effect=RuntimeError("download failed")):
+            with self.assertRaisesRegex(RuntimeError, "download failed"):
+                ctl.update()
+        self.assertTrue((self.home / ".fs25-update-incomplete").exists())
+        self.assertEqual(save.read_bytes(), b"original save")
+
+    def test_postupdate_process_prevents_success(self):
+        self.update_fixture()
+        with mock.patch.object(ctl, "update_steamcmd"), \
+                mock.patch.object(ctl, "require_update_idle", side_effect=[None, ctl.MaintenanceBusy("late game")]):
+            with self.assertRaisesRegex(ctl.MaintenanceBusy, "late game"):
+                ctl.update()
+        self.assertTrue((self.home / ".fs25-update-incomplete").exists())
+
+    def test_client_update_keeps_lease_until_explicit_confirmation(self):
+        self.update_fixture(mode="client")
+        ctl.ensure_directories()
+        with mock.patch.object(ctl, "prepare"), mock.patch.object(ctl, "steam_launch_context", return_value=(["steam"], self.home, {})), \
+                mock.patch.object(ctl.subprocess, "Popen") as launch, mock.patch("builtins.input", return_value="UPDATED"):
+            ctl.update()
+        self.assertEqual(launch.call_args.args[0], ["steam", "steam://validate/2300320"])
+        self.assertFalse((self.home / ".fs25-update-incomplete").exists())
+
+    def test_declined_giants_update_keeps_blocker(self):
+        self.update_fixture(source="giants")
+        self.game.mkdir(parents=True)
+        (self.game / "FarmingSimulator2025.exe").touch()
+        with mock.patch.object(ctl, "interactive_process") as run, mock.patch("builtins.input", return_value="no"):
+            with self.assertRaisesRegex(RuntimeError, "not confirmed"):
+                ctl.update()
+        self.assertEqual(run.call_args.args[0], ["wine", str(self.game / "FarmingSimulator2025.exe")])
+        self.assertTrue((self.home / ".fs25-update-incomplete").exists())
+
+    def test_existing_cli_download_is_not_killed(self):
+        with mock.patch.object(ctl, "matching_processes", return_value=[99]), mock.patch.object(ctl, "shutdown_steam") as shutdown:
+            with self.assertRaises(ctl.MaintenanceBusy):
+                ctl.stop_update_clients()
+        shutdown.assert_not_called()
+
+    def test_failed_client_shutdown_does_not_start_update(self):
+        with mock.patch.object(ctl, "matching_processes", side_effect=[[], [77]]), \
+                mock.patch.object(ctl, "shutdown_steam"), mock.patch.object(ctl.time, "monotonic", side_effect=[0, 21]):
+            with self.assertRaisesRegex(ctl.MaintenanceBusy, "not exited"):
+                ctl.stop_update_clients()
+
+
+class SteamCMDTests(RuntimeFixture):
+    def setUp(self):
+        super().setUp()
+        os.environ.update({"INSTALL_SOURCE": "steam", "STEAM_DOWNLOAD_MODE": "steamcmd", "FS25_STEAM_BACKEND": "windows"})
+
+    def catalog(self):
+        return {"extended": {"listofdlc": "777,888,999"}, "depots": {
+            "780": {"dlcappid": "777", "manifests": {"public": {"gid": "123"}}},
+            "781": {"dlcappid": "888", "config": {"oslist": "macos"}, "manifests": {"public": {"gid": "456"}}},
+            "782": {"dlcappid": "999", "config": {"oslist": "windows"}},
+        }}
+
+    def cli_install(self):
+        directory = self.home / "steamcmd/game"
+        (directory / "x64").mkdir(parents=True)
+        (directory / "steamapps").mkdir()
+        for name in ("FarmingSimulator2025.exe", "dedicatedServer.exe", "x64/FarmingSimulator2025Game.exe", "x64/steam_api64.dll"):
+            (directory / name).touch()
+        (directory / "steamapps/appmanifest_2300320.acf").write_text(
+            '"AppState" { "appid" "2300320" "StateFlags" "4" "installdir" "/custom/force/path" "InstalledDepots" { "780" { "dlcappid" "777" "manifest" "123" } } }')
+        return directory
+
+    def test_cli_manifest_resolves_fixed_root_not_gui_common_directory(self):
+        directory = self.cli_install()
+        self.assertEqual(ctl.steam_game_directory(), directory.resolve())
+        self.assertFalse(self.library.exists())
+
+    def test_cli_mode_does_not_silently_reuse_gui_manifest(self):
+        self.steam_install()
+        with self.assertRaises(ctl.SteamNotReady):
+            ctl.steam_game_directory()
+
+    def test_cli_partial_download_blocks_start(self):
+        directory = self.cli_install()
+        (directory / "steamapps/downloading/2300320").mkdir(parents=True)
+        (directory / "steamapps/downloading/2300320/part").touch()
+        with self.assertRaises(ctl.SteamNotReady):
+            ctl.steam_game_directory()
+
+    def test_cli_mode_requires_compatible_runtime(self):
+        os.environ["FS25_STEAM_BACKEND"] = "linux"
+        with self.assertRaisesRegex(ValueError, "native Proton"):
+            ctl.steam_download_mode()
+
+    def test_catalog_excludes_mac_and_unpublished_depots_not_entitlements(self):
+        ids, depots = ctl.steamcmd_dlc_catalog(self.catalog())
+        self.assertEqual(ids, {"777", "888", "999"})
+        self.assertEqual(depots, {"780": "777"})
+
+    def test_catalog_keeps_empty_os_and_language_as_universal(self):
+        info = self.catalog()
+        info["depots"]["780"]["config"] = {"oslist": "", "language": "", "osarch": ""}
+        self.assertEqual(ctl.steamcmd_dlc_catalog(info)[1], {"780": "777"})
+
+    def test_untrusted_app_id_is_not_used_as_console_command(self):
+        info = {"extended": {"listofdlc": "777,+quit"}}
+        with self.assertRaises(RuntimeError):
+            ctl.steamcmd_dlc_catalog(info)
+
+    def test_appinfo_ignores_banner_and_trailer_but_handles_quoted_braces(self):
+        value = ctl.steamcmd_app_info('banner\n"2300320" { "common" { "name" "a { farm }" } }\nUnloading Steam API...OK')
+        self.assertEqual(value["common"]["name"], "a { farm }")
+        for text in ('"2300320" {', '"123" {}'):
+            with self.assertRaises(RuntimeError):
+                ctl.steamcmd_app_info(text)
+
+    def test_license_stdout_supports_wrapped_apps_and_missing_licenses(self):
+        output = 'License packageID 12:\n - State : Active (flags 0x0)\n - Apps : 2300320,\n 777, (2 in total)\n - Depots : (0 in total)\nNo active license found for appID 888.\n'
+        self.assertEqual(ctl.steamcmd_owned_dlcs(output, {"777", "888"}), {"777"})
+        with self.assertRaisesRegex(RuntimeError, "every DLC"):
+            ctl.steamcmd_owned_dlcs(output, {"777", "999"})
+
+    def test_inactive_and_contradictory_licenses_are_not_entitlements(self):
+        for text in ("License packageID 12:\nState : Expired\nApps : 777, (1 in total)",
+                     "License packageID 12:\nState : Active\nApps : 777, (1 in total)\nNo active license found for appID 777."):
+            with self.subTest(text=text), self.assertRaises(RuntimeError):
+                ctl.steamcmd_owned_dlcs(text, {"777"})
+
+    def test_bootstrap_preserves_self_updated_client_files(self):
+        bootstrap = self.home / "bootstrap"
+        bootstrap.mkdir()
+        (bootstrap / "steamcmd.sh").write_bytes(b"vendor bootstrap")
+        with mock.patch.object(ctl, "STEAMCMD_BOOTSTRAP", bootstrap):
+            launcher = ctl.prepare_steamcmd()
+            launcher.write_bytes(b"self updated")
+            self.assertEqual(ctl.prepare_steamcmd().read_bytes(), b"self updated")
+
+    def update_fixture(self):
+        directory = self.cli_install()
+        launcher = self.home / "steamcmd/client/steamcmd.sh"
+        launcher.parent.mkdir()
+        launcher.touch()
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.object(ctl, "prepare_steamcmd", return_value=launcher))
+        stack.enter_context(mock.patch.object(ctl, "steamcmd_app_info", return_value=self.catalog()))
+        stack.enter_context(mock.patch("builtins.input", return_value="account_fixture"))
+        run = stack.enter_context(mock.patch.object(ctl, "interactive_process", side_effect=["metadata", "License packageID 12:\nState : Active (flags 0x0)\nApps : 777, (1 in total)\nNo active license found for appID 888.\nNo active license found for appID 999.\n", "Success!"]))
+        return directory, run
+
+    def test_cli_download_validates_live_entitlements_and_writes_nonsecret_receipt(self):
+        directory, run = self.update_fixture()
+        ctl.update_steamcmd()
+        self.assertEqual(len(run.call_args_list), 3)
+        self.assertEqual(run.call_args.args[0][-4:], ["+app_update", "2300320", "validate", "+quit"])
+        self.assertEqual(run.call_args.kwargs["process_env"]["HOME"], str(self.home / "steamcmd/home"))
+        receipt = json.loads((self.home / "steamcmd/verified-dlcs.json").read_text())
+        self.assertEqual(receipt["owned_dlcs"], ["777"])
+        self.assertNotIn("account_fixture", json.dumps(receipt))
+        self.assertNotIn("WINEPREFIX", run.call_args.kwargs["process_env"])
+
+    def test_missing_entitlement_response_prevents_game_download(self):
+        directory, run = self.update_fixture()
+        run.side_effect = ["metadata", "No active license found for appID 777."]
+        with self.assertRaises(RuntimeError):
+            ctl.update_steamcmd()
+        self.assertEqual(run.call_count, 2)
+
+    def test_missing_owned_depot_is_not_reported_as_success(self):
+        directory, run = self.update_fixture()
+        manifest = directory / "steamapps/appmanifest_2300320.acf"
+        manifest.write_text(manifest.read_text().replace('"780"', '"790"'))
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            ctl.update_steamcmd()
+        self.assertFalse((self.home / "steamcmd/verified-dlcs.json").exists())
+
+    def test_stale_dlc_manifest_is_not_reported_as_success(self):
+        directory, run = self.update_fixture()
+        manifest = directory / "steamapps/appmanifest_2300320.acf"
+        manifest.write_text(manifest.read_text().replace('"123"', '"100"'))
+        with self.assertRaisesRegex(RuntimeError, "current public manifest"):
+            ctl.update_steamcmd()
+
+    def test_account_prompt_rejects_injected_console_arguments(self):
+        directory, run = self.update_fixture()
+        with mock.patch("builtins.input", return_value="name +quit"):
+            with self.assertRaises(ValueError):
+                ctl.update_steamcmd()
+        run.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "linux", "Symlink containment integration requires Linux")
+    def test_cli_path_symlink_outside_home_is_rejected_before_bootstrap_copy(self):
+        with tempfile.TemporaryDirectory() as outside:
+            (self.home / "steamcmd").mkdir()
+            (self.home / "steamcmd/game").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "inside persistent HOME"):
+                ctl.prepare_steamcmd()
+
+
+class UpdateBuildContractTests(unittest.TestCase):
+    def test_steamcmd_is_checksum_pinned_and_elf_dependencies_checked(self):
+        text = (SOURCE / "Dockerfile").read_text()
+        self.assertIn("cebf0046bfd08cf45da6bc094ae47aa39ebf4155e5ede41373b579b8f1071e7c", text)
+        self.assertIn("ldd /opt/fs25/steamcmd/linux32/steamcmd", text)
+        self.assertIn("STEAM_DOWNLOAD_MODE=client", text)
+
+    def test_egg_has_explicit_optin_and_still_no_authentication_secrets(self):
+        egg = json.loads((SOURCE / "egg-farming-simulator-25.json").read_text())
+        variables = {item["env_variable"]: item for item in egg["variables"]}
+        self.assertEqual(variables["STEAM_DOWNLOAD_MODE"]["default_value"], "client")
+        self.assertIn("in:client,steamcmd", variables["STEAM_DOWNLOAD_MODE"]["rules"])
+        self.assertFalse(any("STEAM" in key and any(secret in key for secret in ("PASSWORD", "GUARD", "TOKEN", "USERNAME")) for key in variables))
+
+    def test_candidate_pushes_never_set_latest_tag(self):
+        text = (SOURCE / ".github/workflows/docker.yml").read_text()
+        self.assertIn("'codex/**'", text)
+        self.assertIn('echo "$name:sha-$GITHUB_SHA"', text)
+        self.assertIn('if [ "$GITHUB_REF" = refs/heads/main ]; then\n              echo "$name:latest"', text)
+        self.assertNotIn(":steam-wine1119", text)
+
+
+class MaintenanceOwnerTests(RuntimeFixture):
+    def setUp(self):
+        super().setUp()
+        self.proc = self.home / "proc"
+        self.enterContext(mock.patch.object(ctl, "PROC_DIR", self.proc))
+        self.enterContext(mock.patch.object(ctl.os, "getuid", return_value=os.getuid() if hasattr(os, "getuid") else 0, create=True))
+
+    def owner(self):
+        pid = 31337
+        path = self.proc / str(pid)
+        path.mkdir(parents=True)
+        (path / "stat").write_text(f'{pid} (owner (with spaces)) ' + ' '.join(["S"] + ["0"] * 18 + ["123"]))
+        (path / "cmdline").write_bytes(b"python3\0/opt/fs25/fs25ctl.py\0start-webserver\0")
+        (self.home / ".fs25-webserver.json").write_text(json.dumps({"pid": pid, "start_time": "123"}))
+        return pid
+
+    def test_verified_owner_and_parenthesized_stat_name(self):
+        pid = self.owner()
+        self.assertEqual(ctl.server_owner(), pid)
+
+    def test_pid_reuse_is_not_signalled(self):
+        pid = self.owner()
+        (self.proc / str(pid) / "stat").write_text(f'{pid} (new process) ' + ' '.join(["S"] + ["0"] * 18 + ["456"]))
+        self.assertIsNone(ctl.server_owner())
+
+    def test_foreign_controller_is_rejected(self):
+        pid = self.owner()
+        (self.proc / str(pid) / "cmdline").write_bytes(b"python3\0unrelated.py\0start-webserver\0")
+        with self.assertRaises(ctl.MaintenanceBusy):
+            ctl.server_owner()
+
+
+class ActivityLockTests(unittest.TestCase):
+    def test_shared_and_exclusive_locks_are_nonblocking_and_inode_is_kept(self):
+        for exclusive, expected in ((False, 5), (True, 6)):
+            fcntl = mock.Mock(LOCK_EX=2, LOCK_SH=1, LOCK_NB=4, LOCK_UN=8)
+            with self.subTest(exclusive=exclusive), tempfile.TemporaryDirectory() as home, \
+                    mock.patch.object(ctl, "HOME", pathlib.Path(home)), mock.patch.dict(sys.modules, {"fcntl": fcntl}):
+                with self.assertRaisesRegex(ValueError, "test exit"):
+                    with ctl.activity_lock(exclusive=exclusive):
+                        raise ValueError("test exit")
+                self.assertTrue((pathlib.Path(home) / ".fs25-maintenance.lock").exists())
+            self.assertEqual([call.args[1] for call in fcntl.flock.call_args_list], [expected, 8])
+
+    def test_busy_maintenance_does_not_enter_body(self):
+        fcntl = mock.Mock(LOCK_EX=2, LOCK_SH=1, LOCK_NB=4, LOCK_UN=8)
+        fcntl.flock.side_effect = BlockingIOError("busy")
+        with tempfile.TemporaryDirectory() as home, mock.patch.object(ctl, "HOME", pathlib.Path(home)), \
+                mock.patch.dict(sys.modules, {"fcntl": fcntl}):
+            with self.assertRaises(ctl.MaintenanceBusy):
+                with ctl.activity_lock(exclusive=True):
+                    self.fail("Entered update while busy")
+
+    @unittest.skipUnless(sys.platform == "linux", "Real flock requires Linux")
+    def test_real_shared_starts_exclude_update_and_exclusive_update_excludes_starts(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.object(ctl, "HOME", pathlib.Path(home)):
+            with ctl.activity_lock():
+                with ctl.activity_lock():
+                    pass
+                with self.assertRaises(ctl.MaintenanceBusy):
+                    with ctl.activity_lock(exclusive=True):
+                        pass
+            with ctl.activity_lock(exclusive=True):
+                for exclusive in (False, True):
+                    with self.assertRaises(ctl.MaintenanceBusy):
+                        with ctl.activity_lock(exclusive=exclusive):
+                            pass
+            with ctl.activity_lock(exclusive=True):
+                pass
+
+
+@unittest.skipUnless(sys.platform == "linux", "Real controlling PTY integration requires Linux")
+class InteractiveTerminalTests(unittest.TestCase):
+    def execute(self, command):
+        import pty
+        import termios
+        import types
+        with tempfile.TemporaryDirectory() as home:
+            master, slave = pty.openpty()
+            try:
+                before = termios.tcgetattr(slave)
+                output = io.BytesIO()
+                with mock.patch.object(ctl.sys, "stdin", types.SimpleNamespace(fileno=lambda: slave)), \
+                        mock.patch.object(ctl.sys, "stdout", types.SimpleNamespace(buffer=output)):
+                    result = ctl.interactive_process(command, cwd=pathlib.Path(home), capture=True)
+                self.assertEqual(termios.tcgetattr(slave), before)
+                return result, output.getvalue()
+            finally:
+                os.close(master)
+                os.close(slave)
+
+    def test_real_child_gets_controlling_terminal_and_prompt_without_newline_is_forwarded(self):
+        command = [sys.executable, "-c", 'import os,sys; print("PTY="+str(os.isatty(0) and os.isatty(1)),flush=True); fd=os.open("/dev/tty",os.O_RDWR);os.close(fd);sys.stdout.write("PROMPT>");sys.stdout.flush()']
+        result, output = self.execute(command)
+        self.assertIn("PTY=True", result)
+        self.assertTrue(output.endswith(b"PROMPT>"))
+
+    def test_nonzero_exit_is_reported_not_success(self):
+        with self.assertRaisesRegex(RuntimeError, "status 8"):
+            self.execute([sys.executable, "-c", "raise SystemExit(8)"])
 
 
 if __name__ == "__main__":

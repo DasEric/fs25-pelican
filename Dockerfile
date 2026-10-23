@@ -96,12 +96,27 @@ ADD         --checksum=sha256:89a19f70808757c236376ec4bac7748b90a11efbe26def951c
 ADD         --checksum=sha256:05cf84ce342c32a8bcc2fc6c146fa803ecfb339ebe0997584b324700e4a9514a \
             https://repo.steampowered.com/steam/archive/stable/steam-libs-i386_1.0.0.87_i386.deb \
             /tmp/steam-libs-i386.deb
+
+# Namespace-free default: the normal Windows Steam client and current WineHQ.
+# Both Wine architectures are real packages, not mixed with Wine-Proton DLLs.
+ADD         --checksum=sha256:b7db584648c42e6ca0ccd2d71c3d059366dc6fbf3bf97b0809b045ad8d3472cd \
+            https://dl.winehq.org/wine-builds/debian/pool/main/w/wine-staging/wine-staging_11.19~trixie-1_amd64.deb \
+            /tmp/wine-staging.deb
+ADD         --checksum=sha256:a09a949df1b1e297639aa14fb10c43e3c4e66e933f45617e7b9c1ae1e2ae0ded \
+            https://dl.winehq.org/wine-builds/debian/pool/main/w/wine-staging/wine-staging-amd64_11.19~trixie-1_amd64.deb \
+            /tmp/wine-staging-amd64.deb
+ADD         --checksum=sha256:6996249688cbb0e52bf62171eadb1bd42f90cd036f22208ee22c675d43de3d2a \
+            https://dl.winehq.org/wine-builds/debian/pool/main/w/wine-staging/wine-staging-i386_11.19~trixie-1_i386.deb \
+            /tmp/wine-staging-i386.deb
+ADD         --checksum=sha256:7d3654531c32d941b8cae81c4137fc542172bfa9635f169cb392f245a0a12bcb \
+            https://cdn.fastly.steamstatic.com/client/installer/SteamSetup.exe \
+            /opt/fs25/SteamSetup.exe
 COPY        --from=steam-session /steam-session.exe /opt/fs25/steam-session.exe
 COPY        --from=steam-session /usr/share/doc /opt/fs25/steam-probe-licenses
 COPY        --from=steam-session --chown=container /steam-api-test.dll /steam-api-unsupported-test.dll /tmp/
 COPY        --from=steam-session --chown=container /steam-import-64 /tmp/steam-import-64/
 COPY        --from=steam-session --chown=container /steam-import-32 /tmp/steam-import-32/
-RUN         chmod 0444 /opt/fs25/steam-session.exe
+RUN         chmod 0444 /opt/fs25/steam-session.exe /opt/fs25/SteamSetup.exe
 
 # Install Valve's actual dependency metapackages as well: steamdeps checks their
 # presence, not just installed shared libraries. No runtime sudo/package prompts.
@@ -111,6 +126,9 @@ RUN         dpkg --add-architecture i386 \
             && apt-get update \
             && apt-get install -y --no-install-recommends \
                 /tmp/steam-launcher.deb /tmp/steam-libs-amd64.deb /tmp/steam-libs-i386.deb \
+                /tmp/wine-staging.deb /tmp/wine-staging-amd64.deb /tmp/wine-staging-i386.deb \
+                libfontconfig1 libfontconfig1:i386 libfreetype6 libfreetype6:i386 \
+                libgnutls30t64 libgnutls30t64:i386 \
                 libc6:i386 libcrypt1:i386 libgcc-s1:i386 libstdc++6:i386 \
                 libegl1:i386 libgbm1:i386 libgl1:i386 libgl1-mesa-dri:i386 \
                 libgpg-error0:i386 libudev1:i386 libxcb-dri3-0:i386 \
@@ -120,9 +138,12 @@ RUN         dpkg --add-architecture i386 \
                 mesa-vulkan-drivers mesa-vulkan-drivers:i386 \
                 bubblewrap xdg-utils xdg-desktop-portal xdg-desktop-portal-gtk \
             && test -x /usr/bin/steam \
+            && test -x /opt/wine-staging/bin/wine \
+            && /opt/wine-staging/bin/wine --version \
             && dpkg-query -W steam-launcher steam-libs-amd64 steam-libs-i386 \
             && rm -f /etc/apt/sources.list.d/steam-stable.list /etc/apt/sources.list.d/steam-beta.list \
             && rm /tmp/steam-launcher.deb /tmp/steam-libs-amd64.deb /tmp/steam-libs-i386.deb \
+            && rm /tmp/wine-staging.deb /tmp/wine-staging-amd64.deb /tmp/wine-staging-i386.deb \
             && rm -rf /var/lib/apt/lists/*
 
 # Let Debian select its FFmpeg library ABI instead of pinning release-specific package names.
@@ -219,10 +240,25 @@ RUN         if { ldd /opt/fs25/wine/bin/wine /opt/fs25/wine/bin/wineserver \
 COPY        LICENSE /opt/fs25/LICENSE
 RUN         chmod 0444 /opt/fs25/LICENSE
 
+# Official native console downloader. The running container copies the bootstrap
+# into persistent, writable HOME; passwords/Guard never enter the image or egg.
+ADD         --checksum=sha256:cebf0046bfd08cf45da6bc094ae47aa39ebf4155e5ede41373b579b8f1071e7c \
+            https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz \
+            /tmp/steamcmd_linux.tar.gz
+RUN         mkdir -p /opt/fs25/steamcmd \
+            && tar -xzf /tmp/steamcmd_linux.tar.gz -C /opt/fs25/steamcmd \
+            && chmod -R a+rX /opt/fs25/steamcmd \
+            && ldd /opt/fs25/steamcmd/linux32/steamcmd > /tmp/fs25-steamcmd-libs.txt \
+            && cat /tmp/fs25-steamcmd-libs.txt \
+            && ! grep -q 'not found' /tmp/fs25-steamcmd-libs.txt \
+            && rm /tmp/steamcmd_linux.tar.gz /tmp/fs25-steamcmd-libs.txt
+
 COPY        entrypoint.py fs25ctl.py /opt/fs25/
 RUN         chmod 0555 /opt/fs25/entrypoint.py /opt/fs25/fs25ctl.py
 
 ENV         HOME=/home/container \
+            FS25_STEAM_BACKEND=windows \
+            STEAM_DOWNLOAD_MODE=client \
             USER=container \
             LOGNAME=container \
             SHELL=/bin/bash \
@@ -235,6 +271,23 @@ ENV         HOME=/home/container \
 
 USER        container
 WORKDIR     /home/container
+
+# Exercise the same WineHQ runtime used by Windows Steam and its FS25 server.
+# Real client login/downloads still require an account and live-node validation.
+RUN         mkdir -m 0700 /tmp/fs25-steam-wine-smoke \
+            && WINEPREFIX=/tmp/fs25-steam-wine-smoke WINEARCH=win64 \
+            WINEDLLOVERRIDES=mscoree=d WINEDEBUG=-all \
+            WINESERVER=/opt/wine-staging/bin/wineserver PATH=/opt/wine-staging/bin:$PATH \
+            timeout 240 xvfb-run -a /bin/sh -c \
+                'wineboot --init && wine cmd /d /s /c ver \
+                && wine "C:\windows\syswow64\cmd.exe" /d /s /c ver \
+                && wine /tmp/steam-import-64/steam-import-test.exe "Z:\tmp\steam-import-64\steamclient64.dll" \
+                && wine /tmp/steam-import-32/steam-import-test.exe "Z:\tmp\steam-import-32\steamclient.dll" \
+                && wine /tmp/steam-import-64/steam-gui-test.exe \
+                && wine /tmp/steam-import-32/steam-gui-test.exe \
+                && FS25_STEAM_STUB_MODE=ready wine /opt/fs25/steam-session.exe "Z:\tmp\steam-api-test.dll" \
+                && wineserver -w' \
+            && rm -rf /tmp/fs25-steam-wine-smoke
 
 # Verify both Windows architectures against the final runtime, without touching server data.
 # Wine needs an existing prefix owned by this user, not the root-owned /tmp parent.

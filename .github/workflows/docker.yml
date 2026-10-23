@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - 'codex/**'
   workflow_dispatch:
 
 permissions:
@@ -17,7 +18,7 @@ concurrency:
 jobs:
   build:
     name: FS25 linux/amd64
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/codex/')
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -35,7 +36,16 @@ jobs:
         id: image
         shell: bash
         run: |
-          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          {
+            echo 'tags<<IMAGE_TAGS'
+            echo "$name:sha-$GITHUB_SHA"
+            if [ "$GITHUB_REF" = refs/heads/main ]; then
+              echo "$name:latest"
+            fi
+            echo 'IMAGE_TAGS'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -52,9 +62,7 @@ jobs:
           platforms: linux/amd64
           pull: true
           push: true
-          tags: |
-            ${{ steps.image.outputs.name }}:latest
-            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+          tags: ${{ steps.image.outputs.tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
